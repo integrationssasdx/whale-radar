@@ -1,0 +1,12 @@
+{
+  "name": "whale-radar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "On-chain anomaly and whale tracking engine: fund-flow graph, anomaly scoring, alert routing.",
+  "bin": {
+    "whale-radar": "bin/whale-radar.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
