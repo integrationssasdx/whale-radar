@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""whale-radar 可执行入口，仅依赖 Python 3 标准库，可离线运行。"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from whale_radar.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
