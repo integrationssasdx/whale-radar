@@ -22,6 +22,10 @@
 
 - `bin/whale-radar analyze`：资金流图、巨鲸转账、逐笔异常打分与告警路由。
 - `bin/whale-radar trace`：同链同资产上的资金路径追踪。
+- `bin/whale-radar trace-risk`：风险路径与告警路由。输入为 transfers、
+  whale_threshold_usd、routes 与 trace 查询字段（chain、asset、
+  start_address、end_address、max_hops），成功时 data 仅含 `paths`、
+  `alerts` 两个数组。
 - `bin/whale-radar rank`：高风险巨鲸地址画像（profiles）与按 route/地址
   聚合的告警（alerts）。输入同 analyze（transfers、whale_threshold_usd、
   routes），成功时 data 仅含 `profiles`、`alerts` 两个数组。
