@@ -48,3 +48,42 @@ stdout 为空，退出码 2。
 - `whale-radar rank`：高风险巨鲸地址画像（profiles）与按 route/地址
   聚合的告警（alerts）。输入同 analyze（transfers、whale_threshold_usd、
   routes），成功时 data 仅含 `profiles`、`alerts` 两个数组。
+
+## scoring 配置
+
+`analyze`、`trace-risk`、`rank` 接受可选的顶层 `scoring` 对象，逐项
+覆盖异常打分的窗口、阈值与分值；省略 `scoring` 或仅提供部分字段时，
+缺失项沿用下列基线值，输出与基线完全一致。`trace` 不做打分，`scoring`
+（即使字段未知或非法）对其完全忽略。
+
+| 字段 | 基线 | 类型与范围 |
+| --- | --- | --- |
+| `window_seconds` | 3600 | 1..10000 整数 |
+| `burst_count` | 5 | 1..10000 整数 |
+| `fan_out_recipients` | 3 | 1..10000 整数 |
+| `value_points_per_ratio` | 20 | 0..1000 有限数 |
+| `value_points_cap` | 40 | 0..100 有限数 |
+| `transfer_burst_points` | 25 | 0..100 有限数 |
+| `fan_out_points` | 20 | 0..100 有限数 |
+| `round_trip_points` | 15 | 0..100 有限数 |
+| `whale_points` | 40 | 0..100 有限数 |
+| `counterparty_count` | 3 | 1..10000 整数 |
+| `counterparty_points` | 25 | 0..100 有限数 |
+| `address_round_trip_points` | 20 | 0..100 有限数 |
+| `address_burst_points` | 15 | 0..100 有限数 |
+
+整数字段不接受浮点、字符串或布尔值；数值字段不接受布尔值、`NaN`、
+`Infinity`。逐笔基础分为 `usd_value / whale_threshold_usd`
+× `value_points_per_ratio`，截到 `value_points_cap`；突发、扇出、
+往返命中再各加对应分值，总分限制在 0..100，窗口为闭区间。地址画像
+沿用原有原因（WHALE_EXPOSURE、COUNTERPARTY_DISTRIBUTION、
+ROUND_TRIP_ACTIVITY、BURST_ACTIVITY）与地址分值，总分限制在 0..100。
+trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths` 与
+`alerts`。原因名称与顺序、阈值与 `min_score` 的等值边界、星号匹配、
+告警去重与稳定排序均不随配置改变。
+
+`scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，三个命令
+均向 stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout
+为空，退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才
+触发：analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
+INVALID_TRACE_QUERY；`trace` 永不产生此错误。

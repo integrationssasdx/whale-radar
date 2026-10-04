@@ -986,5 +986,389 @@ class RankCliTests(unittest.TestCase):
                          {"error": "INVALID_INPUT_SCHEMA"})
 
 
+class ScoringAnalyzeTests(unittest.TestCase):
+    def with_scoring(self, transfers, scoring, threshold=10000.0, routes=None):
+        body = payload(transfers, threshold=threshold, routes=routes)
+        body["scoring"] = scoring
+        return analyze(body)
+
+    def test_ratio_and_cap_custom(self):
+        data = self.with_scoring(
+            [tx("big", "A", "B", usd=10000)],
+            {"value_points_per_ratio": 50, "value_points_cap": 30},
+        )
+        item = data["scores"][0]
+        self.assertEqual(item["score"], 30)
+        self.assertEqual(item["reason"], ["VALUE"])
+
+    def test_ratio_zero_suppresses_value(self):
+        data = self.with_scoring(
+            [tx("big", "A", "B", usd=999999)],
+            {"value_points_per_ratio": 0},
+        )
+        item = data["scores"][0]
+        self.assertEqual(item["score"], 0)
+        self.assertEqual(item["reason"], [])
+
+    def test_burst_count_and_points_custom(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, usd=0,
+               ts="2026-10-04T10:%02d:00Z" % (i * 10))
+            for i in range(3)
+        ]
+        data = self.with_scoring(
+            transfers,
+            {"burst_count": 3, "transfer_burst_points": 7,
+             "fan_out_recipients": 100},
+        )
+        by_id = {s["id"]: s for s in data["scores"]}
+        self.assertEqual(by_id["t0"]["score"], 7)
+        self.assertEqual(by_id["t0"]["reason"], ["BURST"])
+
+    def test_window_seconds_closed_interval(self):
+        transfers = [
+            tx("t1", "A", "x0", usd=0),
+            tx("t2", "A", "x1", usd=0, ts="2026-10-04T10:10:00Z"),
+        ]
+        data = self.with_scoring(
+            transfers, {"window_seconds": 600, "burst_count": 2,
+                        "fan_out_recipients": 100}
+        )
+        by_id = {s["id"]: s for s in data["scores"]}
+        # 恰好 600 秒落在闭窗口内。
+        self.assertIn("BURST", by_id["t1"]["reason"])
+
+    def test_fan_out_threshold_and_points_custom(self):
+        transfers = [
+            tx("f1", "A", "r1", usd=0),
+            tx("f2", "A", "r2", usd=0, ts="2026-10-04T10:10:00Z"),
+        ]
+        data = self.with_scoring(
+            transfers, {"fan_out_recipients": 2, "fan_out_points": 11,
+                        "burst_count": 100}
+        )
+        by_id = {s["id"]: s for s in data["scores"]}
+        self.assertEqual(by_id["f1"]["score"], 11)
+        self.assertEqual(by_id["f1"]["reason"], ["FAN_OUT"])
+
+    def test_round_trip_points_custom(self):
+        data = self.with_scoring(
+            [
+                tx("out", "A", "B", amount=7.0, asset="USDC", usd=0),
+                tx("back", "B", "A", amount=7.0, asset="USDC", usd=0,
+                   ts="2026-10-04T11:00:00Z"),
+            ],
+            {"round_trip_points": 5},
+        )
+        by_id = {s["id"]: s for s in data["scores"]}
+        self.assertEqual(by_id["out"]["score"], 5)
+        self.assertEqual(by_id["back"]["score"], 5)
+
+    def test_partial_config_missing_fields_keep_baseline(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, usd=0,
+               ts="2026-10-04T10:%02d:00Z" % (i * 10))
+            for i in range(5)
+        ]
+        # 仅覆盖突发分值；扇出仍为基线 20，窗口/阈值仍为基线。
+        data = self.with_scoring(transfers, {"transfer_burst_points": 30})
+        top = data["scores"][0]
+        self.assertEqual(top["score"], 50)
+        self.assertEqual(top["reason"], ["BURST", "FAN_OUT"])
+
+    def test_total_still_clamped_to_100(self):
+        data = self.with_scoring(
+            [tx("big", "A", "B", usd=100000)],
+            {"value_points_per_ratio": 1000, "value_points_cap": 100},
+            threshold=10000,
+        )
+        self.assertEqual(data["scores"][0]["score"], 100)
+
+    def assert_invalid(self, scoring):
+        body = payload([])
+        body["scoring"] = scoring
+        with self.assertRaises(AnalyzeError) as ctx:
+            analyze(body)
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_scoring_must_be_object(self):
+        for bad in ([], "x", 1, 1.5, None, True):
+            self.assert_invalid(bad)
+
+    def test_unknown_field_rejected(self):
+        self.assert_invalid({"unknown_field": 1})
+
+    def test_int_fields_must_be_int_in_range(self):
+        for field in ("window_seconds", "burst_count",
+                      "fan_out_recipients", "counterparty_count"):
+            for bad in (0, -1, 10001, 1.0, "5", True, None):
+                self.assert_invalid({field: bad})
+        # 边界合法。
+        for field in ("window_seconds", "burst_count",
+                      "fan_out_recipients", "counterparty_count"):
+            body = payload([])
+            body["scoring"] = {field: 1}
+            self.assertEqual(analyze(body)["scores"], [])
+            body["scoring"] = {field: 10000}
+            self.assertEqual(analyze(body)["scores"], [])
+
+    def test_ratio_field_type_and_range(self):
+        for bad in (-0.01, 1000.01, "10", True, None,
+                    float("inf"), float("nan")):
+            self.assert_invalid({"value_points_per_ratio": bad})
+        for ok in (0, 1000, 0.5, 1000.0):
+            body = payload([])
+            body["scoring"] = {"value_points_per_ratio": ok}
+            analyze(body)
+
+    def test_point_fields_type_and_range(self):
+        fields = ("value_points_cap", "transfer_burst_points",
+                  "fan_out_points", "round_trip_points", "whale_points",
+                  "counterparty_points", "address_round_trip_points",
+                  "address_burst_points")
+        for field in fields:
+            for bad in (-0.01, 100.01, "10", True, None,
+                        float("inf"), float("nan")):
+                self.assert_invalid({field: bad})
+            # 0 与 100 边界合法（校验为全命令共享，analyze 也接受画像字段）。
+            body = payload([])
+            body["scoring"] = {field: 0}
+            analyze(body)
+            body["scoring"] = {field: 100}
+            analyze(body)
+
+    def test_error_precedence_scoring_last(self):
+        def code(body):
+            with self.assertRaises(AnalyzeError) as ctx:
+                analyze(body)
+            return ctx.exception.code
+
+        body = {"transfers": [], "scoring": []}
+        self.assertEqual(code(body), "INVALID_INPUT_SCHEMA")
+
+        body = payload([tx("dup", "A", "B"),
+                        tx("dup", "A", "B", ts="bad")])
+        body["scoring"] = []
+        self.assertEqual(code(body), "DUPLICATE_TRANSFER_ID")
+
+        body = payload([tx("t", "A", "B", amount=0)])
+        body["scoring"] = []
+        self.assertEqual(code(body), "INVALID_TRANSFER_VALUE")
+
+        body = payload([], threshold=0, routes=[route("r", 200, "info")])
+        body["scoring"] = []
+        self.assertEqual(code(body), "INVALID_THRESHOLD")
+
+        body = payload([], routes=[route("r", 101, "info")])
+        body["scoring"] = []
+        self.assertEqual(code(body), "INVALID_ROUTE")
+
+
+class ScoringRankTests(unittest.TestCase):
+    def with_scoring(self, transfers, scoring, threshold=10000.0):
+        body = payload(transfers, threshold=threshold)
+        body["scoring"] = scoring
+        return rank(body)
+
+    def test_whale_points_custom(self):
+        data = self.with_scoring(
+            [tx("hi", "C", "D", usd=10000)], {"whale_points": 7}
+        )
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["C"]["risk_score"], 7)
+        self.assertEqual(prof["D"]["risk_score"], 7)
+
+    def test_counterparty_count_and_points_custom(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, usd=1)
+            for i in range(2)
+        ]
+        data = self.with_scoring(
+            transfers,
+            {"counterparty_count": 2, "counterparty_points": 9,
+             "whale_points": 0},
+        )
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["risk_score"], 9)
+
+    def test_address_round_trip_and_burst_custom(self):
+        data = self.with_scoring(
+            [
+                tx("out", "A", "B", amount=7.0, asset="USDC"),
+                tx("back", "B", "A", amount=7.0, asset="USDC",
+                   ts="2026-10-04T11:00:00Z"),
+            ],
+            {"address_round_trip_points": 5, "whale_points": 0},
+        )
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["risk_score"], 5)
+
+        transfers = [
+            tx("t%d" % i, "A", "x%d" % i, usd=1,
+               ts="2026-10-04T10:%02d:00Z" % (i * 10))
+            for i in range(5)
+        ]
+        data = self.with_scoring(
+            transfers,
+            {"address_burst_points": 6, "burst_count": 5,
+             "counterparty_count": 100, "whale_points": 0},
+        )
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["risk_score"], 6)
+
+    def test_baseline_score_stays_integer(self):
+        data = self.with_scoring(
+            [tx("hi", "C", "D", usd=10000)], {"whale_points": 40}
+        )
+        prof = next(p for p in data["profiles"] if p["address"] == "C")
+        self.assertIsInstance(prof["risk_score"], int)
+        self.assertEqual(prof["risk_score"], 40)
+
+    def test_clamped_to_100(self):
+        data = self.with_scoring(
+            [tx("hi", "C", "D", usd=10000)], {"whale_points": 100}
+        )
+        self.assertEqual(
+            max(p["risk_score"] for p in data["profiles"]), 100
+        )
+
+    def test_invalid_scoring(self):
+        body = payload([])
+        body["scoring"] = {"whale_points": 101}
+        with self.assertRaises(AnalyzeError) as ctx:
+            rank(body)
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_route_error_precedes_scoring(self):
+        body = payload([], routes=[route("r", 101, "info")])
+        body["scoring"] = []
+        with self.assertRaises(AnalyzeError) as ctx:
+            rank(body)
+        self.assertEqual(ctx.exception.code, "INVALID_ROUTE")
+
+
+class ScoringTraceRiskTests(unittest.TestCase):
+    def risk_with_scoring(self, scoring, **kwargs):
+        transfers = kwargs.pop("transfers", [
+            tx("t1", "A", "B", usd=10000),
+            tx("t2", "B", "D", usd=5000),
+        ])
+        body = {
+            "transfers": transfers,
+            "whale_threshold_usd": 10000,
+            "routes": kwargs.pop("routes", []),
+            "chain": "eth",
+            "asset": "ETH",
+            "start_address": "A",
+            "end_address": "D",
+            "max_hops": 4,
+        }
+        body.update(kwargs)
+        body["scoring"] = scoring
+        return trace_risk(body)
+
+    def test_scoring_changes_segment_sum(self):
+        data = self.risk_with_scoring(
+            {"value_points_per_ratio": 10, "value_points_cap": 100}
+        )
+        path = next(p for p in data["paths"] if p["path_id"] == "t1>t2")
+        # t1=10、t2=5，合计 15。
+        self.assertEqual(path["score"], 15)
+
+    def test_path_sum_caps_at_100(self):
+        data = self.risk_with_scoring(
+            {"value_points_per_ratio": 1000, "value_points_cap": 100},
+            transfers=[tx("t1", "A", "D", usd=10000)],
+        )
+        self.assertEqual(data["paths"][0]["score"], 100)
+
+    def test_invalid_scoring_after_valid_query(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.risk_with_scoring([])
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_query_error_precedes_scoring(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.risk_with_scoring([], max_hops=0)
+        self.assertEqual(ctx.exception.code, "INVALID_TRACE_QUERY")
+
+
+class ScoringTraceIgnoredTests(unittest.TestCase):
+    def test_trace_ignores_scoring_entirely(self):
+        body = {
+            "transfers": [tx("t1", "A", "D", usd=1)],
+            "chain": "eth",
+            "asset": "ETH",
+            "start_address": "A",
+            "end_address": "D",
+            "max_hops": 3,
+            "scoring": {"totally_unknown": True, "burst_count": 0},
+        }
+        data = trace(body)
+        self.assertEqual(data["paths"][0]["transfer_ids"], ["t1"])
+
+
+class ScoringCliTests(unittest.TestCase):
+    def test_analyze_scoring_success(self):
+        body = payload([tx("t1", "A", "B", usd=10000)])
+        body["scoring"] = {"value_points_per_ratio": 5}
+        proc = subprocess.run(
+            [BIN, "analyze"], input=json.dumps(body),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["data"]["scores"][0]["score"], 5)
+
+    def assert_invalid_scoring(self, command):
+        body = payload([])
+        body["scoring"] = {"window_seconds": 0}
+        proc = subprocess.run(
+            [BIN, command], input=json.dumps(body),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+    def test_analyze_rank_trace_risk_invalid_scoring(self):
+        self.assert_invalid_scoring("analyze")
+        self.assert_invalid_scoring("rank")
+        risk = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "chain": "eth", "asset": "ETH", "start_address": "A",
+            "end_address": "D", "max_hops": 3,
+            "scoring": {"window_seconds": 0},
+        }
+        proc = subprocess.run(
+            [BIN, "trace-risk"], input=json.dumps(risk),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+    def test_trace_invalid_scoring_still_succeeds(self):
+        body = {
+            "transfers": [tx("t1", "A", "D", usd=1)],
+            "chain": "eth", "asset": "ETH",
+            "start_address": "A", "end_address": "D", "max_hops": 3,
+            "scoring": "not-an-object",
+        }
+        proc = subprocess.run(
+            [BIN, "trace"], input=json.dumps(body),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout)["data"]["paths"][0]["transfer_ids"],
+            ["t1"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

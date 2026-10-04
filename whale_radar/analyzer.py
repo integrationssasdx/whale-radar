@@ -5,6 +5,7 @@
 
 INPUT_NOT_JSON -> INVALID_INPUT_SCHEMA -> DUPLICATE_TRANSFER_ID
 -> INVALID_TRANSFER_VALUE -> INVALID_THRESHOLD -> INVALID_ROUTE
+-> INVALID_SCORING_CONFIG
 """
 
 from __future__ import annotations
@@ -12,15 +13,42 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-WINDOW_SECONDS = 3600
+# 可配置异常分值的基线默认值；scoring 中省略的字段沿用这些值。
+DEFAULT_SCORING = {
+    "window_seconds": 3600,
+    "burst_count": 5,
+    "fan_out_recipients": 3,
+    "value_points_per_ratio": 20.0,
+    "value_points_cap": 40.0,
+    "transfer_burst_points": 25.0,
+    "fan_out_points": 20.0,
+    "round_trip_points": 15.0,
+    "whale_points": 40,
+    "counterparty_count": 3,
+    "counterparty_points": 25,
+    "address_round_trip_points": 20,
+    "address_burst_points": 15,
+}
 
-VALUE_POINTS_CAP = 40.0
-VALUE_POINTS_PER_RATIO = 20.0
-BURST_COUNT = 5
-BURST_POINTS = 25.0
-FAN_OUT_RECIPIENTS = 3
-FAN_OUT_POINTS = 20.0
-ROUND_TRIP_POINTS = 15.0
+# 窗口与数量阈值：1..10000 的整数（不接受 bool）。
+SCORING_INT_FIELDS = ("window_seconds", "burst_count", "fan_out_recipients",
+                      "counterparty_count")
+# value_points_per_ratio：0..1000 的有限数（不接受 bool）。
+SCORING_RATIO_FIELDS = ("value_points_per_ratio",)
+# 其余分值与 value_points_cap：0..100 的有限数（不接受 bool）。
+SCORING_POINT_FIELDS = (
+    "value_points_cap",
+    "transfer_burst_points",
+    "fan_out_points",
+    "round_trip_points",
+    "whale_points",
+    "counterparty_points",
+    "address_round_trip_points",
+    "address_burst_points",
+)
+SCORING_FIELDS = (
+    SCORING_INT_FIELDS + SCORING_RATIO_FIELDS + SCORING_POINT_FIELDS
+)
 
 REASON_VALUE = "VALUE"
 REASON_BURST = "BURST"
@@ -193,6 +221,55 @@ def _validate_routes(routes):
             raise AnalyzeError("INVALID_ROUTE")
 
 
+def _validate_scoring(payload):
+    """scoring 配置校验：必须是对象、字段已知且类型/范围合法。
+
+    可部分提供，缺失字段沿用 DEFAULT_SCORING；返回完整的配置 dict。
+    该项在既有校验之后触发，任何不合法都抛 INVALID_SCORING_CONFIG。
+    """
+    if "scoring" not in payload:
+        return dict(DEFAULT_SCORING)
+    raw = payload["scoring"]
+    if not isinstance(raw, dict):
+        raise AnalyzeError("INVALID_SCORING_CONFIG")
+    unknown = set(raw) - set(SCORING_FIELDS)
+    if unknown:
+        raise AnalyzeError("INVALID_SCORING_CONFIG")
+
+    config = dict(DEFAULT_SCORING)
+    for field in SCORING_INT_FIELDS:
+        if field in raw:
+            value = raw[field]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not (1 <= value <= 10000)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+            config[field] = value
+    for field in SCORING_RATIO_FIELDS:
+        if field in raw:
+            value = raw[field]
+            if (
+                not _is_number(value)
+                or not math.isfinite(float(value))
+                or not (0 <= float(value) <= 1000)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+            config[field] = float(value)
+    for field in SCORING_POINT_FIELDS:
+        if field in raw:
+            value = raw[field]
+            if (
+                not _is_number(value)
+                or not math.isfinite(float(value))
+                or not (0 <= float(value) <= 100)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+            config[field] = float(value)
+    return config
+
+
 def _build_graph(transfers):
     nodes = {}
     edges = {}
@@ -268,7 +345,7 @@ def _round10(value):
     return int(rounded) if rounded.is_integer() else rounded
 
 
-def _score_transfers(transfers, threshold):
+def _score_transfers(transfers, threshold, config):
     # 反向、同资产、等 amount 的转账索引：(to, from, asset, amount) -> id 集合
     reverse_index = {}
     for transfer in transfers:
@@ -286,25 +363,30 @@ def _score_transfers(transfers, threshold):
         total = 0.0
 
         value_points = min(
-            float(transfer["usd_value"]) / threshold * VALUE_POINTS_PER_RATIO,
-            VALUE_POINTS_CAP,
+            float(transfer["usd_value"]) / threshold
+            * config["value_points_per_ratio"],
+            config["value_points_cap"],
         )
         if value_points > 0:
             total += value_points
             reasons.append(REASON_VALUE)
 
-        window_end = transfer["timestamp"] + timedelta(seconds=WINDOW_SECONDS)
+        window_end = transfer["timestamp"] + timedelta(
+            seconds=config["window_seconds"]
+        )
         window = [
             other
             for other in transfers
             if other["from_address"] == transfer["from_address"]
             and transfer["timestamp"] <= other["timestamp"] <= window_end
         ]
-        if len(window) >= BURST_COUNT:
-            total += BURST_POINTS
+        if len(window) >= config["burst_count"]:
+            total += config["transfer_burst_points"]
             reasons.append(REASON_BURST)
-        if len({other["to_address"] for other in window}) >= FAN_OUT_RECIPIENTS:
-            total += FAN_OUT_POINTS
+        if len({other["to_address"] for other in window}) >= config[
+            "fan_out_recipients"
+        ]:
+            total += config["fan_out_points"]
             reasons.append(REASON_FAN_OUT)
 
         reverse_key = (
@@ -318,7 +400,7 @@ def _score_transfers(transfers, threshold):
             and reverse_key in reverse_index
         )
         if is_round_trip:
-            total += ROUND_TRIP_POINTS
+            total += config["round_trip_points"]
             reasons.append(REASON_ROUND_TRIP)
 
         score = max(0.0, min(100.0, total))
@@ -369,6 +451,7 @@ def analyze(payload):
     transfers = _validate_values(transfers_raw)
     _validate_threshold(threshold)
     _validate_routes(routes)
+    config = _validate_scoring(payload)
 
     graph = _build_graph(transfers)
     whales = [
@@ -382,7 +465,7 @@ def analyze(payload):
             key=lambda transfer: transfer["id"],
         )
     ]
-    scores = _score_transfers(transfers, threshold)
+    scores = _score_transfers(transfers, threshold, config)
     scores_by_id = {item["id"]: item for item in scores}
     alerts = _route_alerts(transfers, routes, scores_by_id)
 
