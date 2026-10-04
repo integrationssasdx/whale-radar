@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
+from whale_radar.ranker import rank
 from whale_radar.tracer import trace
 
 BIN = os.path.join(
@@ -545,6 +546,265 @@ class TraceCliTests(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_TRACE_QUERY"}
+        )
+
+
+class RankProfileTests(unittest.TestCase):
+    def test_profiles_dedup_and_flow_totals(self):
+        data = rank(payload([
+            tx("t1", "A", "B", usd=100),
+            tx("t2", "A", "B", usd=200),
+            tx("t3", "B", "A", usd=50),
+        ]))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(set(profiles), {"A", "B"})
+        a = profiles["A"]
+        self.assertEqual(a["sent_usd"], 300)
+        self.assertEqual(a["received_usd"], 50)
+        self.assertEqual(a["net_usd"], 250)
+        b = profiles["B"]
+        self.assertEqual(b["sent_usd"], 50)
+        self.assertEqual(b["received_usd"], 300)
+        self.assertEqual(b["net_usd"], -250)
+
+    def test_net_usd_precision(self):
+        data = rank(payload([
+            tx("t1", "A", "B", usd=0.1),
+            tx("t2", "A", "B", usd=0.2),
+        ]))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        # 沿用 _round10 精度约定：0.1 + 0.2 的浮点噪声被消除。
+        self.assertEqual(profiles["A"]["sent_usd"], 0.3)
+        self.assertEqual(profiles["A"]["net_usd"], 0.3)
+        self.assertEqual(profiles["B"]["received_usd"], 0.3)
+        self.assertEqual(profiles["B"]["net_usd"], -0.3)
+
+    def test_whale_transfers_threshold_inclusive_and_self_transfer(self):
+        data = rank(payload([
+            tx("t1", "A", "A", usd=10000),
+            tx("t2", "A", "B", usd=9999.99),
+        ], threshold=10000))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        # 自转账触及同一地址只计一笔；对手方为自身。
+        self.assertEqual(profiles["A"]["whale_transfers"], 1)
+        self.assertEqual(profiles["A"]["counterparties"], 2)
+        self.assertEqual(profiles["B"]["whale_transfers"], 0)
+
+    def test_reasons_and_score_sum(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, amount=3.0, asset="ETH",
+               usd=100000, ts="2026-10-04T10:00:%02dZ" % (i * 5))
+            for i in range(5)
+        ]
+        transfers.append(tx(
+            "back", "r0", "A", amount=3.0, asset="ETH", usd=0,
+            ts="2026-10-04T12:00:00Z"))
+        data = rank(payload(transfers, threshold=10000))
+        top = data["profiles"][0]
+        self.assertEqual(top["address"], "A")
+        self.assertEqual(top["risk_score"], 100)
+        self.assertEqual(
+            top["reasons"],
+            ["WHALE_EXPOSURE", "COUNTERPARTY_DISTRIBUTION",
+             "ROUND_TRIP_ACTIVITY", "BURST_ACTIVITY"],
+        )
+
+    def test_individual_reason_points(self):
+        # 仅巨鲸触及：40
+        data = rank(payload([tx("t1", "A", "B", usd=10000)],
+                            threshold=10000))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(profiles["A"]["risk_score"], 40)
+        self.assertEqual(profiles["A"]["reasons"], ["WHALE_EXPOSURE"])
+        # 仅对手方分布：25
+        data = rank(payload([
+            tx("t1", "A", "x0", usd=0),
+            tx("t2", "A", "x1", usd=0, ts="2026-10-04T10:10:00Z"),
+            tx("t3", "A", "x2", usd=0, ts="2026-10-04T10:20:00Z"),
+        ]))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(profiles["A"]["risk_score"], 25)
+        self.assertEqual(
+            profiles["A"]["reasons"], ["COUNTERPARTY_DISTRIBUTION"]
+        )
+        # 仅双向回转：20
+        data = rank(payload([
+            tx("out", "A", "B", amount=7.0, asset="USDC", usd=0),
+            tx("back", "B", "A", amount=7.0, asset="USDC", usd=0,
+               ts="2026-10-04T11:30:00Z"),
+        ]))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(profiles["A"]["risk_score"], 20)
+        self.assertEqual(profiles["A"]["reasons"], ["ROUND_TRIP_ACTIVITY"])
+        self.assertEqual(profiles["B"]["risk_score"], 20)
+        # 仅突发发送：15（5 笔同接收方，避免触发对手方分布）
+        transfers = [
+            tx("t%d" % i, "A", "same", usd=0,
+               ts="2026-10-04T10:00:%02dZ" % (i * 10))
+            for i in range(5)
+        ]
+        data = rank(payload(transfers))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(profiles["A"]["risk_score"], 15)
+        self.assertEqual(profiles["A"]["reasons"], ["BURST_ACTIVITY"])
+
+    def test_burst_requires_five_in_closed_window(self):
+        transfers = [
+            tx("t%d" % i, "A", "same", usd=0,
+               ts="2026-10-04T10:00:%02dZ" % (i * 10))
+            for i in range(4)
+        ]
+        data = rank(payload(transfers))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(profiles["A"]["risk_score"], 0)
+        self.assertEqual(profiles["A"]["reasons"], [])
+
+    def test_round_trip_requires_distinct_addresses(self):
+        data = rank(payload([
+            tx("t1", "A", "A", amount=7.0, asset="USDC", usd=0),
+        ]))
+        profiles = {p["address"]: p for p in data["profiles"]}
+        self.assertNotIn("ROUND_TRIP_ACTIVITY", profiles["A"]["reasons"])
+
+    def test_profiles_sorted_score_desc_address_asc(self):
+        data = rank(payload([
+            tx("t1", "B", "X", usd=10000),
+            tx("t2", "A", "Y", usd=10000),
+            tx("t3", "C", "Z", usd=0),
+        ], threshold=10000))
+        self.assertEqual(
+            [p["address"] for p in data["profiles"]],
+            ["A", "B", "X", "Y", "C", "Z"],
+        )
+
+
+class RankAlertTests(unittest.TestCase):
+    def test_alert_hit_and_fields(self):
+        routes = [
+            route("r-eth", 40, "critical", chains=("eth",),
+                  assets=("ETH",), target="pager"),
+        ]
+        data = rank(payload(
+            [tx("t1", "A", "B", usd=10000, chain="eth", asset="ETH"),
+             tx("t2", "C", "D", usd=9999, chain="eth", asset="ETH")],
+            threshold=10000, routes=routes))
+        # A、B 巨鲸触及得 40 分命中；C、D 0 分不命中。
+        self.assertEqual(
+            [(a["route_id"], a["address"]) for a in data["alerts"]],
+            [("r-eth", "A"), ("r-eth", "B")],
+        )
+        alert = data["alerts"][0]
+        self.assertEqual(
+            set(alert), {"route_id", "address", "severity", "reason", "target"}
+        )
+        self.assertEqual(alert["severity"], "critical")
+        self.assertEqual(alert["target"], "pager")
+        self.assertEqual(alert["reason"], ["WHALE_EXPOSURE"])
+
+    def test_min_score_inclusive_and_star_matches_any(self):
+        routes = [route("r", 40, "warning")]
+        data = rank(payload(
+            [tx("t1", "A", "B", usd=10000, chain="btc", asset="BTC")],
+            threshold=10000, routes=routes))
+        self.assertEqual(len(data["alerts"]), 2)
+
+    def test_chain_or_asset_mismatch_no_alert(self):
+        routes = [
+            route("r1", 40, "info", chains=("bsc",)),
+            route("r2", 40, "info", assets=("BTC",)),
+        ]
+        data = rank(payload(
+            [tx("t1", "A", "B", usd=50000, chain="eth", asset="ETH")],
+            threshold=10000, routes=routes))
+        self.assertEqual(data["alerts"], [])
+
+    def test_alerts_sorted_by_route_then_address(self):
+        routes = [
+            route("r-b", 0, "info"),
+            route("r-a", 0, "info"),
+        ]
+        data = rank(payload(
+            [tx("t1", "B", "A", usd=1)], threshold=10000, routes=routes))
+        self.assertEqual(
+            [(a["route_id"], a["address"]) for a in data["alerts"]],
+            [("r-a", "A"), ("r-a", "B"), ("r-b", "A"), ("r-b", "B")],
+        )
+
+    def test_one_alert_per_route_and_address(self):
+        routes = [route("r", 0, "info")]
+        data = rank(payload([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "A", "B", usd=2),
+        ], threshold=10000, routes=routes))
+        self.assertEqual(len(data["alerts"]), 2)
+
+
+class RankValidationTests(unittest.TestCase):
+    def assert_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            rank(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_schema_errors(self):
+        self.assert_code("INVALID_INPUT_SCHEMA", [])
+        self.assert_code("INVALID_INPUT_SCHEMA", {"transfers": []})
+        self.assert_code(
+            "INVALID_INPUT_SCHEMA",
+            {"transfers": [], "whale_threshold_usd": "100", "routes": []},
+        )
+        self.assert_code(
+            "INVALID_INPUT_SCHEMA",
+            payload([tx("t1", "A", "B")], routes="x"),
+        )
+        self.assert_code(
+            "INVALID_INPUT_SCHEMA",
+            payload([], routes=[{"id": "r", "min_score": "10"}]),
+        )
+
+    def test_error_priority_matches_analyze(self):
+        bad = tx("dup", "A", "B", ts="not-a-time")
+        self.assert_code(
+            "DUPLICATE_TRANSFER_ID", payload([tx("dup", "A", "B"), bad])
+        )
+        self.assert_code(
+            "INVALID_TRANSFER_VALUE",
+            payload([tx("t", "A", "B", amount=0)]),
+        )
+        self.assert_code(
+            "INVALID_THRESHOLD",
+            payload([], threshold=0, routes=[route("r", 200, "info")]),
+        )
+        self.assert_code(
+            "INVALID_ROUTE", payload([], routes=[route("r", 101, "info")])
+        )
+
+
+class RankCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "rank"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(payload([tx("t1", "A", "B", usd=1)])))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"profiles", "alerts"})
+        self.assertEqual(proc.stderr, "")
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_code_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
         )
 
 

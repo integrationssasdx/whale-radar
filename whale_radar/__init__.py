@@ -2,6 +2,7 @@
 
 __version__ = "0.1.0"
 
-__all__ = ["analyze", "AnalyzeError"]
+__all__ = ["analyze", "rank", "AnalyzeError"]
 
 from .analyzer import AnalyzeError, analyze
+from .ranker import rank
