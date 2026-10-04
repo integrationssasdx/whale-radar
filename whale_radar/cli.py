@@ -1,11 +1,15 @@
-"""命令行入口：``whale-radar analyze`` / ``trace`` / ``rank``
+"""命令行入口：``whale-radar analyze`` / ``trace`` / ``trace-risk`` / ``rank``
 从 stdin 读 JSON、向 stdout 写 JSON。
 
 输入错误不落任何部分报告：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
 结束；成功时退出码 0。全程不联网、不落盘。
+
+命令行用法错误（缺少子命令、未知子命令、未知选项、向子命令传入选项、
+``--version`` 与子命令混用）统一输出 ``{"error": "INVALID_COMMAND"}`` 到
+stderr，stdout 为空，退出码 2。参数解析手工进行，不依赖 argparse 的
+usage 文本，以保证 stderr 只含错误码 JSON。
 """
 
-import argparse
 import json
 import sys
 
@@ -15,30 +19,20 @@ from .ranker import rank
 from .risk import trace_risk
 from .tracer import trace
 
+_COMMANDS = {
+    "analyze": analyze,
+    "trace": trace,
+    "trace-risk": trace_risk,
+    "rank": rank,
+}
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="whale-radar",
-        description="链上异常与巨鲸追踪：资金流图、异常打分与告警路由",
-    )
-    parser.add_argument(
-        "--version", action="version", version="whale-radar %s" % __version__
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
-        "analyze", help="从 stdin 读取 JSON，分析结果 JSON 写入 stdout"
-    )
-    subparsers.add_parser(
-        "trace", help="从 stdin 读取 JSON，资金路径追踪结果 JSON 写入 stdout"
-    )
-    subparsers.add_parser(
-        "trace-risk",
-        help="从 stdin 读取 JSON，风险路径与告警 JSON 写入 stdout",
-    )
-    subparsers.add_parser(
-        "rank", help="从 stdin 读取 JSON，巨鲸画像与聚合告警 JSON 写入 stdout"
-    )
-    return parser
+VERSION_LINE = "whale-radar %s" % __version__
+
+
+def _write_error(code):
+    json.dump({"error": code}, sys.stderr, ensure_ascii=False)
+    sys.stderr.write("\n")
+    return 2
 
 
 def _run(handler):
@@ -54,22 +48,18 @@ def _run(handler):
 
 
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        if args.command == "analyze":
-            return _run(analyze)
-        if args.command == "trace":
-            return _run(trace)
-        if args.command == "trace-risk":
-            return _run(trace_risk)
-        if args.command == "rank":
-            return _run(rank)
-    except AnalyzeError as exc:
-        json.dump({"error": exc.code}, sys.stderr, ensure_ascii=False)
-        sys.stderr.write("\n")
-        return 2
-    return 0
+    if argv is None:
+        argv = sys.argv[1:]
+    # --version 仅可单独出现；与子命令或其他参数混用属于 INVALID_COMMAND。
+    if argv == ["--version"]:
+        sys.stdout.write(VERSION_LINE + "\n")
+        return 0
+    if len(argv) == 1 and argv[0] in _COMMANDS:
+        try:
+            return _run(_COMMANDS[argv[0]])
+        except AnalyzeError as exc:
+            return _write_error(exc.code)
+    return _write_error("INVALID_COMMAND")
 
 
 if __name__ == "__main__":
