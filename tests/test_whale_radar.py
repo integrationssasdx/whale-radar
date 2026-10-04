@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
+from whale_radar.convergence import converge
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
 from whale_radar.tracer import trace
@@ -1784,6 +1785,348 @@ class WatchCliTests(unittest.TestCase):
         body = {
             "transfers": [], "whale_threshold_usd": 10000, "routes": [],
             "watch_addresses": ["A", "D"], "max_hops": 3,
+            "scoring": {"window_seconds": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+
+class ConvergeTests(unittest.TestCase):
+    def converge_query(self, transfers, window=600, min_sources=2,
+                       min_usd=0.0, routes=None, threshold=10000.0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["convergence"] = {
+            "window_seconds": window,
+            "min_sources": min_sources,
+            "min_usd_value": min_usd,
+        }
+        return result
+
+    def test_basic_fan_in_events_and_fields(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", amount=1.0, usd=100, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "B", "D", amount=2.0, usd=200, ts="2026-10-04T10:05:00Z"),
+            tx("t3", "C", "D", amount=4.0, usd=400, ts="2026-10-04T10:11:00Z"),
+        ]))
+        self.assertEqual(set(data), {"events", "alerts"})
+        # t3 距 t1 660 秒超出窗口；t2 起点窗口含 t2、t3；t3 单独不足 2 源。
+        self.assertEqual(
+            [event["event_id"] for event in data["events"]],
+            ["t2>t3", "t1>t2"],
+        )
+        first = data["events"][0]
+        self.assertEqual(
+            set(first),
+            {"event_id", "recipient", "chain", "asset", "source_count",
+             "transfer_ids", "amount", "usd_value", "score", "reason"},
+        )
+        self.assertEqual(first["recipient"], "D")
+        self.assertEqual(first["chain"], "eth")
+        self.assertEqual(first["asset"], "ETH")
+        self.assertEqual(first["source_count"], 2)
+        self.assertEqual(first["transfer_ids"], ["t2", "t3"])
+        self.assertEqual(first["amount"], 6)
+        self.assertEqual(first["usd_value"], 600)
+        # 20*(2-2+1) + 50*600/10000 = 23。
+        self.assertEqual(first["score"], 23)
+        self.assertEqual(first["reason"], ["FAN_IN"])
+        second = data["events"][1]
+        self.assertEqual(second["amount"], 3)
+        self.assertEqual(second["usd_value"], 300)
+        # 20 + 50*300/10000 = 21.5。
+        self.assertEqual(second["score"], 21.5)
+
+    def test_self_transfers_excluded(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=100, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "D", "D", usd=5000, ts="2026-10-04T10:01:00Z"),
+            tx("t3", "B", "D", usd=100, ts="2026-10-04T10:02:00Z"),
+        ]))
+        self.assertEqual(len(data["events"]), 1)
+        event = data["events"][0]
+        self.assertEqual(event["event_id"], "t1>t3")
+        self.assertEqual(event["source_count"], 2)
+        self.assertEqual(event["usd_value"], 200)
+
+    def test_groups_split_by_chain_asset_recipient(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=10),
+            tx("t2", "B", "D", usd=10, chain="bsc"),
+            tx("t3", "A", "E", usd=10),
+            tx("t4", "B", "E", usd=10, asset="USDT"),
+        ]))
+        self.assertEqual(data, {"events": [], "alerts": []})
+
+    def test_min_usd_value_boundary_inclusive(self):
+        transfers = [
+            tx("t1", "A", "D", usd=100),
+            tx("t2", "B", "D", usd=200),
+        ]
+        data = converge(self.converge_query(transfers, min_usd=300))
+        self.assertEqual(len(data["events"]), 1)
+        data = converge(self.converge_query(transfers, min_usd=300.5))
+        self.assertEqual(data["events"], [])
+
+    def test_distinct_sources_required(self):
+        # 同一来源两笔只计一个来源。
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=100),
+            tx("t2", "A", "D", usd=100),
+        ]))
+        self.assertEqual(data["events"], [])
+
+    def test_window_closed_boundary(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=10, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "B", "D", usd=10, ts="2026-10-04T10:10:00Z"),
+        ]))
+        self.assertEqual(
+            [event["event_id"] for event in data["events"]], ["t1>t2"]
+        )
+
+    def test_window_looks_forward_only(self):
+        # t2 起点的窗口不含更早的 t1（时间戳不同）。
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=10, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "B", "D", usd=10, ts="2026-10-04T10:20:00Z"),
+        ]))
+        self.assertEqual(data["events"], [])
+
+    def test_value_reason_appended_at_threshold(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=6000),
+            tx("t2", "B", "D", usd=4000),
+        ]))
+        self.assertEqual(data["events"][0]["reason"], ["FAN_IN", "VALUE"])
+        # 恰好达到阈值时等值命中。
+        self.assertEqual(data["events"][0]["usd_value"], 10000)
+
+    def test_score_scales_with_source_count_and_caps_at_100(self):
+        transfers = [
+            tx("t%d" % index, "S%d" % index, "D", usd=10000,
+               ts="2026-10-04T10:00:0%dZ" % index)
+            for index in range(5)
+        ]
+        data = converge(self.converge_query(transfers, min_sources=2))
+        top = data["events"][0]
+        self.assertEqual(top["source_count"], 5)
+        # 20*(5-2+1) + 50*50000/10000 = 330，截到 100。
+        self.assertEqual(top["score"], 100)
+        self.assertEqual(top["reason"], ["FAN_IN", "VALUE"])
+
+    def test_events_sorted_score_desc_then_event_id(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", usd=100, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "B", "D", usd=100, ts="2026-10-04T10:01:00Z"),
+            tx("t3", "A", "E", usd=100, ts="2026-10-04T10:00:00Z"),
+            tx("t4", "B", "E", usd=100, ts="2026-10-04T10:01:00Z"),
+        ]))
+        # 两组分值相同（20 + 0.5*2 = 21），按 event_id 升序。
+        self.assertEqual(
+            [event["event_id"] for event in data["events"]],
+            ["t1>t2", "t3>t4"],
+        )
+
+    def test_amount_usd_round10_representation(self):
+        data = converge(self.converge_query([
+            tx("t1", "A", "D", amount=0.1, usd=0.1),
+            tx("t2", "B", "D", amount=0.2, usd=0.2),
+        ]))
+        event = data["events"][0]
+        self.assertEqual(event["amount"], 0.3)
+        self.assertEqual(event["usd_value"], 0.3)
+
+    def test_alerts_one_per_route_event_and_sorted(self):
+        transfers = [
+            tx("t1", "A", "D", usd=100, ts="2026-10-04T10:00:00Z"),
+            tx("t2", "B", "D", usd=100, ts="2026-10-04T10:01:00Z"),
+        ]
+        routes = [
+            route("r2", 20, "warning", target="desk"),
+            route("r1", 21, "critical"),
+        ]
+        data = converge(self.converge_query(transfers, routes=routes))
+        # 事件分值 20 + 50*200/10000 = 21，r1 与 r2 均命中。
+        self.assertEqual(
+            [(alert["route_id"], alert["event_id"])
+             for alert in data["alerts"]],
+            [("r1", "t1>t2"), ("r2", "t1>t2")],
+        )
+        alert = data["alerts"][0]
+        self.assertEqual(
+            set(alert),
+            {"route_id", "event_id", "recipient", "chain", "asset",
+             "severity", "score", "reason", "target"},
+        )
+        self.assertEqual(alert["recipient"], "D")
+        self.assertEqual(alert["severity"], "critical")
+        self.assertEqual(alert["score"], 21)
+        self.assertEqual(alert["reason"], ["FAN_IN"])
+        self.assertEqual(alert["target"], "ops")
+        self.assertEqual(data["alerts"][1]["target"], "desk")
+
+    def test_alert_min_score_boundary_inclusive(self):
+        transfers = [
+            tx("t1", "A", "D", usd=100),
+            tx("t2", "B", "D", usd=100),
+        ]
+        data = converge(self.converge_query(
+            transfers, routes=[route("r", 21, "info")]
+        ))
+        self.assertEqual(len(data["alerts"]), 1)
+        data = converge(self.converge_query(
+            transfers, routes=[route("r", 21.5, "info")]
+        ))
+        self.assertEqual(data["alerts"], [])
+
+    def test_alert_chain_asset_star_and_mismatch(self):
+        transfers = [
+            tx("t1", "A", "D", usd=100),
+            tx("t2", "B", "D", usd=100),
+        ]
+        data = converge(self.converge_query(transfers, routes=[
+            route("ok", 0, "info", chains=("*",), assets=("ETH",)),
+            route("bad-chain", 0, "info", chains=("bsc",)),
+            route("bad-asset", 0, "info", assets=("USDT",)),
+        ]))
+        self.assertEqual(
+            [alert["route_id"] for alert in data["alerts"]], ["ok"]
+        )
+
+    def assert_converge_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            converge(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_convergence_query_errors(self):
+        base = [tx("t1", "A", "D")]
+        good = self.converge_query(base)
+        del good["convergence"]
+        self.assert_converge_code("INVALID_CONVERGENCE_QUERY", good)
+        for bad_conv in (
+            None, [], "x",
+            {"window_seconds": 600, "min_sources": 2},
+            {"window_seconds": 600, "min_sources": 2, "min_usd_value": 0,
+             "extra": 1},
+        ):
+            bad = self.converge_query(base)
+            bad["convergence"] = bad_conv
+            self.assert_converge_code("INVALID_CONVERGENCE_QUERY", bad)
+        # window_seconds：1..10000 整数，不接受布尔。
+        for bad_window in (0, 10001, 2.5, "600", True, None):
+            bad = self.converge_query(base, window=bad_window)
+            self.assert_converge_code("INVALID_CONVERGENCE_QUERY", bad)
+        # min_sources：2..10000 整数，不接受布尔。
+        for bad_sources in (1, 0, 10001, 2.5, "2", True, None):
+            bad = self.converge_query(base, min_sources=bad_sources)
+            self.assert_converge_code("INVALID_CONVERGENCE_QUERY", bad)
+        # min_usd_value：非负有限数，不接受布尔。
+        for bad_usd in (-1, "0", True, None, float("nan"),
+                        float("inf")):
+            bad = self.converge_query(base, min_usd=bad_usd)
+            self.assert_converge_code("INVALID_CONVERGENCE_QUERY", bad)
+
+    def test_error_precedence(self):
+        # threshold -> route -> convergence -> scoring。
+        bad = self.converge_query(
+            [], threshold=0, routes=[route("r", 200, "info")], window=0
+        )
+        self.assert_converge_code("INVALID_THRESHOLD", bad)
+        bad = self.converge_query(
+            [], routes=[route("r", 200, "info")], window=0
+        )
+        self.assert_converge_code("INVALID_ROUTE", bad)
+        bad = self.converge_query([], window=0)
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_converge_code("INVALID_CONVERGENCE_QUERY", bad)
+        bad = self.converge_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_converge_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.converge_query(
+            [tx("dup", "A", "D"), tx("dup", "B", "D", ts="bad")])
+        self.assert_converge_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.converge_query([tx("t1", "A", "D", amount=0)])
+        self.assert_converge_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class ConvergeCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "converge"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = {
+            "transfers": [
+                tx("t1", "A", "D", usd=100),
+                tx("t2", "B", "D", usd=100),
+            ],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "convergence": {
+                "window_seconds": 600,
+                "min_sources": 2,
+                "min_usd_value": 0,
+            },
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"events", "alerts"})
+        self.assertEqual(out["data"]["events"][0]["event_id"], "t1>t2")
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_events_and_alerts(self):
+        body = {
+            "transfers": [],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "convergence": {
+                "window_seconds": 600,
+                "min_sources": 2,
+                "min_usd_value": 0,
+            },
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"events": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "convergence": {"window_seconds": 600, "min_sources": 1,
+                            "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_CONVERGENCE_QUERY"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "convergence": {"window_seconds": 600, "min_sources": 2,
+                            "min_usd_value": 0},
             "scoring": {"window_seconds": 0},
         }
         proc = self.run_cli(json.dumps(body))
