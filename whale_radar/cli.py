@@ -12,6 +12,7 @@ import sys
 from . import __version__
 from .analyzer import AnalyzeError, analyze
 from .ranker import rank
+from .risk import trace_risk
 from .tracer import trace
 
 
@@ -29,6 +30,10 @@ def build_parser():
     )
     subparsers.add_parser(
         "trace", help="从 stdin 读取 JSON，资金路径追踪结果 JSON 写入 stdout"
+    )
+    subparsers.add_parser(
+        "trace-risk",
+        help="从 stdin 读取 JSON，风险路径与告警 JSON 写入 stdout",
     )
     subparsers.add_parser(
         "rank", help="从 stdin 读取 JSON，巨鲸画像与聚合告警 JSON 写入 stdout"
@@ -56,6 +61,8 @@ def main(argv=None):
             return _run(analyze)
         if args.command == "trace":
             return _run(trace)
+        if args.command == "trace-risk":
+            return _run(trace_risk)
         if args.command == "rank":
             return _run(rank)
     except AnalyzeError as exc:

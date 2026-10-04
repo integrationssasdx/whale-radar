@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.ranker import rank
+from whale_radar.risk import trace_risk
 from whale_radar.tracer import trace
 
 BIN = os.path.join(
@@ -546,6 +547,208 @@ class TraceCliTests(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_TRACE_QUERY"}
+        )
+
+
+class TraceRiskTests(unittest.TestCase):
+    def risk_query(self, transfers, routes=None, start="A", end="D",
+                   max_hops=4, chain="eth", asset="ETH", threshold=10000.0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result.update({
+            "chain": chain,
+            "asset": asset,
+            "start_address": start,
+            "end_address": end,
+            "max_hops": max_hops,
+        })
+        return result
+
+    def test_path_fields_and_segment_sum_with_path_id(self):
+        data = trace_risk(self.risk_query([
+            tx("t1", "A", "B", usd=50000),   # 40 VALUE
+            tx("t2", "B", "D", usd=5000),    # 10 VALUE
+            tx("t3", "A", "D", usd=50000),   # 40 VALUE
+        ]))
+        self.assertEqual(set(data), {"paths", "alerts"})
+        by_id = {p["path_id"]: p for p in data["paths"]}
+        self.assertEqual(set(by_id), {"t1>t2", "t3"})
+        multi = by_id["t1>t2"]
+        self.assertEqual(
+            set(multi),
+            {"nodes", "transfer_ids", "hops", "amount", "usd_value",
+             "score", "reason", "path_id"},
+        )
+        self.assertEqual(multi["nodes"], ["A", "B", "D"])
+        self.assertEqual(multi["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(multi["hops"], 2)
+        self.assertEqual(multi["amount"], 2)
+        self.assertEqual(multi["usd_value"], 55000)
+        self.assertEqual(multi["score"], 50)
+        self.assertEqual(multi["reason"], ["VALUE"])
+        self.assertEqual(by_id["t3"]["score"], 40)
+
+    def test_score_sorted_desc_then_hops_then_transfer_ids(self):
+        data = trace_risk(self.risk_query([
+            tx("lo", "A", "D", usd=5000),             # 10，1 跳
+            tx("hi1", "A", "B", usd=50000),           # 40
+            tx("hi2", "B", "D", usd=50000),           # 40，合计 80，2 跳
+        ]))
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["hi1>hi2", "lo"]
+        )
+
+    def test_score_tie_breaks_by_hops(self):
+        data = trace_risk(self.risk_query([
+            tx("d", "A", "D", usd=10000),             # 20，1 跳
+            tx("m1", "A", "B", usd=5000),             # 10
+            tx("m2", "B", "D", usd=5000),             # 10，合计 20，2 跳
+        ]))
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["d", "m1>m2"]
+        )
+
+    def test_score_capped_at_100(self):
+        transfers = [
+            tx("w", "A", "B", amount=3.0, asset="ETH", usd=100000),
+            tx("c2", "A", "x2", usd=1, ts="2026-10-04T10:05:00Z"),
+            tx("c3", "A", "x3", usd=1, ts="2026-10-04T10:10:00Z"),
+            tx("c4", "A", "x4", usd=1, ts="2026-10-04T10:20:00Z"),
+            tx("c5", "A", "x5", usd=1, ts="2026-10-04T10:25:00Z"),
+            tx("last", "B", "D", usd=100000),
+        ]
+        data = trace_risk(self.risk_query(transfers))
+        path = next(p for p in data["paths"] if p["path_id"] == "w>last")
+        # w=VALUE+BURST+FAN_OUT=85，last=40，合计截断 100。
+        self.assertEqual(path["score"], 100)
+
+    def test_reason_merged_dedup_in_fixed_order(self):
+        data = trace_risk(self.risk_query([
+            tx("rt", "B", "A", amount=2.0, asset="ETH", usd=0,
+               ts="2026-10-04T11:30:00Z"),
+            tx("s1", "A", "B", amount=2.0, asset="ETH", usd=50000),
+            tx("s2", "B", "D", usd=50000),
+        ]))
+        path = next(p for p in data["paths"] if p["path_id"] == "s1>s2")
+        # s1 同时有 VALUE 与 ROUND_TRIP；s2 仅 VALUE；合并去重且按固定顺序。
+        self.assertEqual(path["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_alerts_one_per_route_path_and_sorted(self):
+        routes = [
+            route("r2", 40, "warning", chains=("eth",), target="email"),
+            route("r1", 40, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+            route("r-btc", 40, "info", chains=("btc",), target="x"),
+        ]
+        data = trace_risk(self.risk_query([
+            tx("t1", "A", "B", usd=50000),
+            tx("t2", "B", "D", usd=50000),
+            tx("t3", "A", "D", usd=50000),
+        ], routes=routes))
+        alerts = data["alerts"]
+        self.assertEqual(
+            [(a["route_id"], a["path_id"]) for a in alerts],
+            [("r1", "t1>t2"), ("r1", "t3"),
+             ("r2", "t1>t2"), ("r2", "t3")],
+        )
+        first = alerts[0]
+        self.assertEqual(
+            set(first),
+            {"route_id", "path_id", "severity", "score", "reason", "target"},
+        )
+        self.assertEqual(first["severity"], "critical")
+        self.assertEqual(first["target"], "pager")
+        self.assertEqual(first["score"], 80)
+        self.assertEqual(first["reason"], ["VALUE"])
+
+    def test_alert_min_score_boundary_inclusive(self):
+        data = trace_risk(self.risk_query(
+            [tx("t1", "A", "D", usd=5000)],   # 恰好 10
+            routes=[route("r", 10, "info")],
+        ))
+        self.assertEqual(
+            [(a["route_id"], a["path_id"]) for a in data["alerts"]],
+            [("r", "t1")],
+        )
+
+    def test_alert_asset_star_and_mismatch(self):
+        data = trace_risk(self.risk_query(
+            [tx("t1", "A", "D", usd=50000)],
+            routes=[route("r", 40, "info", assets=("BTC",))],
+        ))
+        self.assertEqual(data["alerts"], [])
+
+    def test_no_path_no_alerts(self):
+        data = trace_risk(self.risk_query(
+            [tx("t1", "A", "B", usd=50000)],
+            routes=[route("r", 0, "info")], end="Z",
+        ))
+        self.assertEqual(data, {"paths": [], "alerts": []})
+
+    def assert_risk_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            trace_risk(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_error_precedence(self):
+        self.assert_risk_code("INVALID_INPUT_SCHEMA", {})
+        self.assert_risk_code("INVALID_INPUT_SCHEMA", {"transfers": []})
+        # threshold -> route -> query。
+        bad = self.risk_query([], threshold=0,
+                              routes=[route("r", 200, "info")])
+        del bad["chain"]
+        self.assert_risk_code("INVALID_THRESHOLD", bad)
+        bad = self.risk_query([], routes=[route("r", 200, "info")])
+        del bad["chain"]
+        self.assert_risk_code("INVALID_ROUTE", bad)
+        bad = self.risk_query([])
+        del bad["chain"]
+        self.assert_risk_code("INVALID_TRACE_QUERY", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.risk_query(
+            [tx("dup", "A", "B"), tx("dup", "B", "D", ts="bad")])
+        self.assert_risk_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.risk_query([tx("t1", "A", "D", amount=0)])
+        self.assert_risk_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class TraceRiskCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "trace-risk"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = {
+            "transfers": [tx("t1", "A", "D", usd=1)],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "chain": "eth",
+            "asset": "ETH",
+            "start_address": "A",
+            "end_address": "D",
+            "max_hops": 3,
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"paths", "alerts"})
+        self.assertEqual(out["data"]["paths"][0]["path_id"], "t1")
+        self.assertEqual(proc.stderr, "")
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_code_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
         )
 
 
