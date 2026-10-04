@@ -1,11 +1,21 @@
-"""命令行入口：``whale-radar analyze`` / ``trace`` / ``rank``
-从 stdin 读 JSON、向 stdout 写 JSON。
+"""命令行入口：``whale-radar analyze`` / ``trace`` / ``trace-risk`` / ``rank``。
 
-输入错误不落任何部分报告：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
-结束；成功时退出码 0。全程不联网、不落盘。
+四个子命令均从 stdin 读一个 JSON 值、向 stdout 写一个 JSON 对象：
+
+- 成功：stdout 只写 ``{"data": ...}`` 加一个换行，退出码 0。
+- 输入/业务错误（``AnalyzeError``）：stdout 不写任何内容，stderr 写
+  ``{"error": 错误码}`` 加一个换行，退出码 2。错误码、触发条件与优先级
+  完全由 analyzer/tracer/risk/ranker 决定，本模块不改变它们。
+- 命令行本身非法（缺少或未知子命令、未知选项、向不接受选项的子命令
+  传入选项、``--version`` 与子命令混用）：stdout 为空，stderr 只写
+  ``{"error": "INVALID_COMMAND"}`` 加换行，退出码 2。
+- ``--version`` 单独使用时输出 ``whale-radar <版本>`` 并以退出码 0 结束。
+
+仅依赖 Python 3 标准库；不联网、不落盘、不读取凭证、不修改输入文件。
+``python -m whale_radar`` 与 ``bin/whale-radar`` 启动器共用本入口，
+参数解析、JSON 往返与退出码完全一致。
 """
 
-import argparse
 import json
 import sys
 
@@ -15,61 +25,94 @@ from .ranker import rank
 from .risk import trace_risk
 from .tracer import trace
 
+VERSION_LINE = "whale-radar %s\n" % __version__
+INVALID_COMMAND_LINE = '{"error": "INVALID_COMMAND"}\n'
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="whale-radar",
-        description="链上异常与巨鲸追踪：资金流图、异常打分与告警路由",
-    )
-    parser.add_argument(
-        "--version", action="version", version="whale-radar %s" % __version__
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
-        "analyze", help="从 stdin 读取 JSON，分析结果 JSON 写入 stdout"
-    )
-    subparsers.add_parser(
-        "trace", help="从 stdin 读取 JSON，资金路径追踪结果 JSON 写入 stdout"
-    )
-    subparsers.add_parser(
-        "trace-risk",
-        help="从 stdin 读取 JSON，风险路径与告警 JSON 写入 stdout",
-    )
-    subparsers.add_parser(
-        "rank", help="从 stdin 读取 JSON，巨鲸画像与聚合告警 JSON 写入 stdout"
-    )
-    return parser
+_HANDLERS = {
+    "analyze": analyze,
+    "trace": trace,
+    "trace-risk": trace_risk,
+    "rank": rank,
+}
+
+
+class CommandError(Exception):
+    """命令行参数非法（对应 INVALID_COMMAND）。"""
+
+
+def parse_args(argv):
+    """解析命令行参数，返回子命令名或 ``"__version__"``。
+
+    语法刻意保持极小：``whale-radar --version`` 或
+    ``whale-radar <analyze|trace|trace-risk|rank>``；子命令不接受任何
+    选项或额外位置参数，``--version`` 也不得与子命令混用。其余一切
+    形式（无参数、未知子命令、未知选项等）都抛出 :class:`CommandError`。
+    """
+    if len(argv) == 1 and argv[0] == "--version":
+        return "__version__"
+    if len(argv) == 1 and argv[0] in _HANDLERS:
+        return argv[0]
+    raise CommandError
+
+
+def _reconfigure_streams():
+    """强制 stdin/stdout/stderr 使用 UTF-8，输出换行固定为 LF。
+
+    这样在 Windows 的 cmd/PowerShell（不同代码页、CRLF 翻译）与类 Unix
+    shell 下，重定向到管道或文件时得到字节级一致的结果；非 ASCII 内容
+    也不依赖区域设置。测试替身（如 ``io.StringIO``）可能不支持
+    reconfigure，忽略即可。
+    """
+    for stream, newline in (
+        (sys.stdin, None),
+        (sys.stdout, "\n"),
+        (sys.stderr, "\n"),
+    ):
+        try:
+            if newline is None:
+                stream.reconfigure(encoding="utf-8")
+            else:
+                stream.reconfigure(encoding="utf-8", newline=newline)
+        except (AttributeError, ValueError):
+            pass
 
 
 def _run(handler):
-    raw = sys.stdin.read()
+    try:
+        raw = sys.stdin.read()
+    except UnicodeDecodeError:
+        # 非 UTF-8 字节流不可能是约定的 JSON 输入。
+        raise AnalyzeError("INPUT_NOT_JSON")
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         raise AnalyzeError("INPUT_NOT_JSON")
     data = handler(payload)
-    json.dump({"data": data}, sys.stdout, ensure_ascii=False, sort_keys=False)
+    # 先完整序列化再写：即便序列化失败，stdout 上也不会留下部分报告。
+    sys.stdout.write(json.dumps({"data": data}, ensure_ascii=False))
     sys.stdout.write("\n")
     return 0
 
 
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    _reconfigure_streams()
+    if argv is None:
+        argv = sys.argv[1:]
     try:
-        if args.command == "analyze":
-            return _run(analyze)
-        if args.command == "trace":
-            return _run(trace)
-        if args.command == "trace-risk":
-            return _run(trace_risk)
-        if args.command == "rank":
-            return _run(rank)
-    except AnalyzeError as exc:
-        json.dump({"error": exc.code}, sys.stderr, ensure_ascii=False)
-        sys.stderr.write("\n")
+        command = parse_args(argv)
+    except CommandError:
+        sys.stderr.write(INVALID_COMMAND_LINE)
         return 2
-    return 0
+    if command == "__version__":
+        sys.stdout.write(VERSION_LINE)
+        return 0
+    try:
+        return _run(_HANDLERS[command])
+    except AnalyzeError as exc:
+        sys.stderr.write(
+            json.dumps({"error": exc.code}, ensure_ascii=False) + "\n"
+        )
+        return 2
 
 
 if __name__ == "__main__":

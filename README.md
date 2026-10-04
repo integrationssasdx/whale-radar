@@ -8,17 +8,40 @@
 
 ## 状态
 
-初始基线：只有本说明，尚无实现。
+核心分析能力（analyze / trace / trace-risk / rank）与命令行入口均已实现。
 
 ## 约定
 
 - 公开行为以 README 与源码为准。
 - 后续需求在此基线上增量实现。
 
+## 入口
+
+在仓库根目录下，以下两种入口等价，参数解析、JSON 往返、非 ASCII 字符、
+流重定向与退出码完全一致；均只依赖 Python 3 标准库，不依赖 PYTHONPATH、
+pip 安装或联网：
+
+- `bin/whale-radar`：类 Unix shell 启动器（按自身位置定位同仓库内的
+  `whale_radar` 包，从任意当前目录、仓库路径含空格均可运行）。
+- `bin/whale-radar.cmd`：Windows cmd / PowerShell 启动器（同上）。
+- `python -m whale_radar`：模块入口（从仓库根目录运行）。
+
+`--version` 单独使用时输出 `whale-radar 0.1.0` 并以退出码 0 结束。
+
 ## 命令
 
-均从 stdin 读取 JSON、向 stdout 写 JSON；输入错误以退出码 2 结束并向 stderr
-输出 `{"error": 错误码}`，成功退出码 0。仅依赖 Python 3 标准库：
+均从 stdin 读取一个 JSON 值、向 stdout 写一个 JSON 对象；成功时 stdout
+只写 `{"data": ...}` 加换行，退出码 0。输入错误以退出码 2 结束，stdout
+不写任何内容（不留部分报告），stderr 只写 `{"error": 错误码}` 加换行。
+错误码、触发条件与优先级为：
+
+INPUT_NOT_JSON → INVALID_INPUT_SCHEMA → DUPLICATE_TRANSFER_ID
+→ INVALID_TRANSFER_VALUE → INVALID_THRESHOLD → INVALID_ROUTE
+→ INVALID_TRACE_QUERY（trace / trace-risk 专用）
+
+命令行本身非法——缺少子命令、未知子命令、未知选项、向不接受选项的
+子命令传入选项，或把 `--version` 与子命令混用——时同样以退出码 2
+结束，stdout 为空，stderr 只写 `{"error": "INVALID_COMMAND"}` 加换行。
 
 - `bin/whale-radar analyze`：资金流图、巨鲸转账、逐笔异常打分与告警路由。
 - `bin/whale-radar trace`：同链同资产上的资金路径追踪。

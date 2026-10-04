@@ -2,8 +2,10 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,6 +19,14 @@ BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "bin",
     "whale-radar",
+)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 两种入口：仓库内启动器与 python -m whale_radar（从仓库根目录启动），
+# 二者行为必须完全一致。
+LAUNCHERS = (
+    ("bin", [BIN]),
+    ("module", [sys.executable, "-m", "whale_radar"]),
 )
 
 BASE_TS = "2026-10-04T10:00:00Z"
@@ -984,6 +994,160 @@ class RankCliTests(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertEqual(json.loads(proc.stderr),
                          {"error": "INVALID_INPUT_SCHEMA"})
+
+
+class EntryPointTests(unittest.TestCase):
+    """命令入口契约：--version、INVALID_COMMAND、两种入口完全等价。"""
+
+    @classmethod
+    def setUpClass(cls):
+        # 复制一份到含空格的临时目录，验证启动器按自身位置定位包，
+        # 且不依赖 PYTHONPATH / pip 安装。
+        cls.spaces_dir = tempfile.mkdtemp(prefix="whale radar ")
+        cls.spaced_repo = os.path.join(cls.spaces_dir, "repo")
+        shutil.copytree(
+            REPO_ROOT,
+            cls.spaced_repo,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.spaces_dir, ignore_errors=True)
+
+    def run_entry(self, label, argv, raw=b"", cwd=None, bin_path=None):
+        if label == "bin":
+            cmd = [bin_path or os.path.join(
+                cwd or REPO_ROOT, "bin", "whale-radar")] + argv
+        else:
+            cmd = [sys.executable, "-m", "whale_radar"] + argv
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        return subprocess.run(
+            cmd, input=raw, capture_output=True, cwd=cwd or REPO_ROOT, env=env
+        )
+
+    def assert_invalid_command(self, proc):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr, b'{"error": "INVALID_COMMAND"}\n')
+
+    def test_version(self):
+        for label, _ in LAUNCHERS:
+            with self.subTest(launcher=label):
+                proc = self.run_entry(label, ["--version"])
+                self.assertEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, b"whale-radar 0.1.0\n")
+                self.assertEqual(proc.stderr, b"")
+
+    def test_invalid_command_forms(self):
+        bad_argv = (
+            [],                       # 缺少子命令
+            ["bogus"],                # 未知子命令
+            ["--help"],               # 未知选项
+            ["-h"],
+            ["--version=1"],
+            ["analyze", "--help"],    # 子命令不接受选项
+            ["trace", "-x"],
+            ["rank", "extra"],        # 多余位置参数
+            ["analyze", "rank"],      # 多个子命令
+            ["--version", "analyze"],  # --version 与子命令混用
+            ["analyze", "--version"],
+        )
+        for label, _ in LAUNCHERS:
+            for argv in bad_argv:
+                with self.subTest(launcher=label, argv=argv):
+                    self.assert_invalid_command(
+                        self.run_entry(label, argv, b"{}")
+                    )
+
+    def _success_body(self, subcmd):
+        if subcmd == "analyze" or subcmd == "rank":
+            return json.dumps(payload(
+                [tx("t1", "0x甲", "0x乙", usd=50000)],
+                routes=[route("r", 40, "critical")],
+            ), ensure_ascii=False).encode("utf-8")
+        body = {
+            "transfers": [tx("t1", "0x甲", "0x乙", usd=50000)],
+            "whale_threshold_usd": 10000,
+            "routes": [route("r", 40, "critical")],
+            "chain": "eth",
+            "asset": "ETH",
+            "start_address": "0x甲",
+            "end_address": "0x乙",
+            "max_hops": 3,
+        }
+        return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    def test_launchers_byte_identical_on_success(self):
+        for subcmd in ("analyze", "trace", "trace-risk", "rank"):
+            raw = self._success_body(subcmd)
+            results = {}
+            for label, _ in LAUNCHERS:
+                proc = self.run_entry(label, [subcmd], raw)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stderr, b"")
+                results[label] = proc
+            self.assertEqual(
+                results["bin"].stdout, results["module"].stdout
+            )
+            out = results["bin"].stdout
+            self.assertTrue(out.endswith(b'}\n') and not out.endswith(b'\n\n'))
+            parsed = json.loads(out.decode("utf-8"))
+            self.assertEqual(set(parsed), {"data"})
+            # 非 ASCII 字符原样往返。
+            self.assertIn("0x甲".encode("utf-8"), out)
+
+    def test_launchers_byte_identical_on_error(self):
+        schema_codes = {
+            "analyze": "INVALID_INPUT_SCHEMA",
+            "trace": "INVALID_TRACE_QUERY",
+            "trace-risk": "INVALID_INPUT_SCHEMA",
+            "rank": "INVALID_INPUT_SCHEMA",
+        }
+        cases = (
+            (b"{not json", "INPUT_NOT_JSON"),
+        )
+        for subcmd in ("analyze", "trace", "trace-risk", "rank"):
+            for raw, code in cases + (
+                (json.dumps({"transfers": []}).encode(),
+                 schema_codes[subcmd]),
+            ):
+                results = {}
+                for label, _ in LAUNCHERS:
+                    proc = self.run_entry(label, [subcmd], raw)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertEqual(proc.stdout, b"")
+                    results[label] = proc
+                self.assertEqual(
+                    results["bin"].stderr,
+                    results["module"].stderr,
+                )
+                self.assertEqual(
+                    json.loads(results["bin"].stderr), {"error": code}
+                )
+
+    def test_bin_launcher_works_from_unrelated_cwd(self):
+        # 不依赖 PYTHONPATH：从临时目录直接调用启动器也能定位包。
+        proc = self.run_entry(
+            "bin", ["--version"], cwd=self.spaces_dir, bin_path=BIN
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, b"whale-radar 0.1.0\n")
+
+    def test_spaces_in_repo_path(self):
+        for label, _ in LAUNCHERS:
+            with self.subTest(launcher=label):
+                proc = self.run_entry(
+                    label, ["--version"], cwd=self.spaced_repo
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, b"whale-radar 0.1.0\n")
+                raw = self._success_body("analyze")
+                proc = self.run_entry(
+                    label, ["analyze"], raw, cwd=self.spaced_repo
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(set(json.loads(proc.stdout)), {"data"})
 
 
 if __name__ == "__main__":
