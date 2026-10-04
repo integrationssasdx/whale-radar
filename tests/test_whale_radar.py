@@ -12,6 +12,7 @@ from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
 from whale_radar.tracer import trace
+from whale_radar.watch import watch
 
 BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1367,6 +1368,428 @@ class ScoringCliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(proc.stdout)["data"]["paths"][0]["transfer_ids"],
             ["t1"],
+        )
+
+
+class WatchTests(unittest.TestCase):
+    def watch_query(self, transfers, watch=("A", "D"), routes=None,
+                    max_hops=4, threshold=10000.0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["watch_addresses"] = list(watch)
+        result["max_hops"] = max_hops
+        return result
+
+    def test_direct_and_multi_hop_paths_between_watch_addresses(self):
+        data = watch(self.watch_query([
+            tx("t1", "A", "B", amount=1.0, usd=10),
+            tx("t2", "B", "D", amount=2.0, usd=20),
+            tx("t3", "A", "D", amount=5.0, usd=50),
+        ]))
+        self.assertEqual(set(data), {"paths", "alerts"})
+        self.assertEqual(
+            [(p["path_id"], p["from_address"], p["to_address"])
+             for p in data["paths"]],
+            [("t3", "A", "D"), ("t1>t2", "A", "D")],
+        )
+        direct = data["paths"][0]
+        self.assertEqual(
+            set(direct),
+            {"nodes", "transfer_ids", "hops", "amount", "usd_value",
+             "from_address", "to_address", "chain", "asset", "path_id",
+             "score", "reason"},
+        )
+        self.assertEqual(direct["nodes"], ["A", "D"])
+        self.assertEqual(direct["hops"], 1)
+        self.assertEqual(direct["amount"], 5)
+        self.assertEqual(direct["usd_value"], 50)
+        self.assertEqual(direct["chain"], "eth")
+        self.assertEqual(direct["asset"], "ETH")
+        # 50/10000*20 = 0.1。
+        self.assertEqual(direct["score"], 0.1)
+        self.assertEqual(direct["reason"], ["VALUE"])
+        relay = data["paths"][1]
+        self.assertEqual(relay["nodes"], ["A", "B", "D"])
+        self.assertEqual(relay["amount"], 3)
+        self.assertEqual(relay["usd_value"], 30)
+        # t1=0.02、t2=0.04，合计 0.06。
+        self.assertEqual(relay["score"], 0.06)
+        self.assertEqual(relay["reason"], ["VALUE"])
+
+    def test_paths_for_every_ordered_pair_of_watch_addresses(self):
+        data = watch(self.watch_query([
+            tx("a2b", "A", "B", usd=1),
+            tx("b2c", "B", "C", usd=1),
+            tx("c2d", "C", "D", usd=1),
+            tx("d2a", "D", "A", usd=1),
+        ], watch=("A", "B", "C", "D")))
+        endpoints = {
+            (p["from_address"], p["to_address"], p["hops"])
+            for p in data["paths"]
+        }
+        self.assertIn(("A", "B", 1), endpoints)
+        self.assertIn(("A", "C", 2), endpoints)
+        self.assertIn(("A", "D", 3), endpoints)
+        self.assertIn(("B", "C", 1), endpoints)
+        self.assertIn(("B", "D", 2), endpoints)
+        self.assertIn(("C", "D", 1), endpoints)
+        self.assertIn(("D", "A", 1), endpoints)
+        # D -> B：沿 D->A->B，2 跳；C -> A：沿 C->D->A，2 跳。
+        self.assertIn(("D", "B", 2), endpoints)
+        self.assertIn(("C", "A", 2), endpoints)
+
+    def test_intermediate_watch_address_still_extends(self):
+        # A->B->D 与 A->B->C->D 都应出现（B、C 同为关注地址）。
+        data = watch(self.watch_query([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "B", "C", usd=1),
+            tx("t3", "C", "D", usd=1),
+        ], watch=("A", "B", "C", "D")))
+        ids = {p["path_id"] for p in data["paths"]}
+        self.assertIn("t1", ids)
+        self.assertIn("t1>t2", ids)
+        self.assertIn("t1>t2>t3", ids)
+        self.assertIn("t2", ids)
+        self.assertIn("t2>t3", ids)
+        self.assertIn("t3", ids)
+
+    def test_paths_stay_within_same_chain_and_asset(self):
+        data = watch(self.watch_query([
+            tx("t1", "A", "D", chain="bsc", asset="BNB"),
+            tx("t2", "A", "B", chain="bsc", asset="USDT"),
+            tx("t3", "B", "D", chain="eth", asset="BNB"),
+            tx("t4", "A", "B"),
+            tx("t5", "B", "D"),
+        ]))
+        ids = {p["path_id"] for p in data["paths"]}
+        self.assertEqual(ids, {"t1", "t4>t5"})
+        by_id = {p["path_id"]: p for p in data["paths"]}
+        self.assertEqual(by_id["t1"]["chain"], "bsc")
+        self.assertEqual(by_id["t1"]["asset"], "BNB")
+
+    def test_no_path_when_no_connection_between_watched(self):
+        data = watch(self.watch_query([
+            tx("t1", "A", "x1"),
+            tx("t2", "x2", "D"),
+        ]))
+        self.assertEqual(data, {"paths": [], "alerts": []})
+
+    def test_non_watch_addresses_never_anchor_paths(self):
+        # 仅 B->C 这一段不触及关注地址，即使直接相连也不产生路径。
+        data = watch(self.watch_query([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "B", "C", usd=1),
+            tx("t3", "C", "x", usd=1),
+        ], watch=("A", "D")))
+        self.assertEqual(data["paths"], [])
+
+    def test_simple_paths_no_repeated_addresses(self):
+        data = watch(self.watch_query([
+            tx("t1", "A", "B"),
+            tx("t2", "B", "C"),
+            tx("t3", "C", "B"),
+            tx("t4", "C", "D"),
+        ]))
+        self.assertEqual(
+            sorted(p["path_id"] for p in data["paths"]), ["t1>t2>t4"]
+        )
+
+    def test_max_hops_limits_depth(self):
+        transfers = [
+            tx("t1", "A", "B"),
+            tx("t2", "B", "C"),
+            tx("t3", "C", "D"),
+        ]
+        self.assertEqual(watch(self.watch_query(transfers, max_hops=2))["paths"],
+                         [])
+        data = watch(self.watch_query(transfers, max_hops=3))
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["t1>t2>t3"]
+        )
+
+    def test_parallel_edges_yield_distinct_paths(self):
+        data = watch(self.watch_query([
+            tx("t2", "A", "D", amount=2.0, usd=5000),
+            tx("t1", "A", "D", amount=1.0, usd=50000),
+        ]))
+        # 分值不同：t1 为 40，t2 为 10，按分值降序。
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["t1", "t2"]
+        )
+
+    def test_score_sum_clamped_and_reason_dedup(self):
+        data = watch(self.watch_query([
+            tx("rt", "B", "A", amount=2.0, asset="ETH", usd=0,
+               ts="2026-10-04T11:30:00Z"),
+            tx("s1", "A", "B", amount=2.0, asset="ETH", usd=50000),
+            tx("s2", "B", "D", usd=50000),
+        ]))
+        path = next(p for p in data["paths"] if p["path_id"] == "s1>s2")
+        # s1=VALUE 40 + ROUND_TRIP 15，s2=VALUE 40，合计 95。
+        self.assertEqual(path["score"], 95)
+        self.assertEqual(path["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_paths_sorted_score_desc_then_hops_chain_asset_ids(self):
+        data = watch(self.watch_query([
+            tx("lo", "A", "D", usd=10000),              # 20，1 跳
+            tx("hi1", "A", "B", usd=50000),             # 40
+            tx("hi2", "B", "D", usd=50000),             # 80，2 跳
+        ]))
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["hi1>hi2", "lo"]
+        )
+
+    def test_score_tie_breaks_by_hops(self):
+        data = watch(self.watch_query([
+            tx("d", "A", "D", usd=10000),     # 20
+            tx("m1", "A", "B", usd=5000),     # 10
+            tx("m2", "B", "D", usd=5000),     # 20
+        ]))
+        self.assertEqual(
+            [p["path_id"] for p in data["paths"]], ["d", "m1>m2"]
+        )
+
+    def test_chain_asset_tie_break_ordering(self):
+        data = watch(self.watch_query([
+            tx("z", "A", "D", chain="eth", asset="USDC", usd=10000),
+            tx("a", "A", "D", chain="eth", asset="ETH", usd=10000),
+            tx("b", "A", "D", chain="bsc", asset="BNB", usd=10000),
+        ]))
+        # 同分同跳数：chain 升序后 asset 升序。
+        self.assertEqual(
+            [(p["chain"], p["asset"]) for p in data["paths"]],
+            [("bsc", "BNB"), ("eth", "ETH"), ("eth", "USDC")],
+        )
+
+    def test_amount_usd_round10_representation(self):
+        data = watch(self.watch_query([
+            tx("t1", "A", "B", amount=0.1, usd=0.2),
+            tx("t2", "B", "D", amount=0.2, usd=0.1),
+        ]))
+        path = data["paths"][0]
+        self.assertEqual(path["amount"], 0.3)
+        self.assertEqual(path["usd_value"], 0.3)
+
+    def test_alerts_one_per_route_path_and_sorted(self):
+        routes = [
+            route("r2", 40, "warning", chains=("eth",), target="email"),
+            route("r1", 40, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+            route("r-btc", 40, "info", chains=("btc",), target="x"),
+        ]
+        data = watch(self.watch_query([
+            tx("t1", "A", "B", usd=50000),
+            tx("t2", "B", "D", usd=50000),
+            tx("t3", "A", "D", usd=50000),
+        ], routes=routes))
+        alerts = data["alerts"]
+        self.assertEqual(
+            [(a["route_id"], a["path_id"]) for a in alerts],
+            [("r1", "t1>t2"), ("r1", "t3"),
+             ("r2", "t1>t2"), ("r2", "t3")],
+        )
+        first = alerts[0]
+        self.assertEqual(
+            set(first),
+            {"route_id", "path_id", "from_address", "to_address",
+             "chain", "asset", "severity", "score", "reason", "target"},
+        )
+        self.assertEqual(first["from_address"], "A")
+        self.assertEqual(first["to_address"], "D")
+        self.assertEqual(first["chain"], "eth")
+        self.assertEqual(first["asset"], "ETH")
+        self.assertEqual(first["severity"], "critical")
+        self.assertEqual(first["target"], "pager")
+        self.assertEqual(first["score"], 80)
+        self.assertEqual(first["reason"], ["VALUE"])
+
+    def test_alert_min_score_boundary_inclusive(self):
+        data = watch(self.watch_query(
+            [tx("t1", "A", "D", usd=5000)],
+            routes=[route("r", 10, "info")],
+        ))
+        self.assertEqual(
+            [(a["route_id"], a["path_id"]) for a in data["alerts"]],
+            [("r", "t1")],
+        )
+
+    def test_alert_chain_asset_star_and_mismatch(self):
+        data = watch(self.watch_query(
+            [tx("t1", "A", "D", usd=50000)],
+            routes=[route("r", 40, "info", chains=("eth",),
+                          assets=("BTC",))],
+        ))
+        self.assertEqual(data["alerts"], [])
+
+    def assert_watch_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            watch(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_watch_query_errors(self):
+        base = [tx("t1", "A", "D")]
+        for field in ("watch_addresses", "max_hops"):
+            bad = self.watch_query(base)
+            del bad[field]
+            self.assert_watch_code("INVALID_WATCH_QUERY", bad)
+        # 至少两个地址。
+        self.assert_watch_code(
+            "INVALID_WATCH_QUERY", self.watch_query(base, watch=("A",))
+        )
+        self.assert_watch_code(
+            "INVALID_WATCH_QUERY", self.watch_query(base, watch=[])
+        )
+        # 必须互异。
+        self.assert_watch_code(
+            "INVALID_WATCH_QUERY", self.watch_query(base, watch=("A", "A"))
+        )
+        # 必须为非空字符串。
+        self.assert_watch_code(
+            "INVALID_WATCH_QUERY", self.watch_query(base, watch=("A", ""))
+        )
+        self.assert_watch_code(
+            "INVALID_WATCH_QUERY", self.watch_query(base, watch=("A", 1))
+        )
+        bad = self.watch_query(base)
+        bad["watch_addresses"] = "AD"
+        self.assert_watch_code("INVALID_WATCH_QUERY", bad)
+        # max_hops 1..8 整数。
+        for bad_hops in (0, 9, 2.5, "3", True, None):
+            self.assert_watch_code(
+                "INVALID_WATCH_QUERY",
+                self.watch_query(base, max_hops=bad_hops),
+            )
+
+    def test_error_precedence(self):
+        # threshold -> route -> watch query -> scoring。
+        bad = self.watch_query(
+            [], threshold=0, routes=[route("r", 200, "info")], watch=("A",)
+        )
+        self.assert_watch_code("INVALID_THRESHOLD", bad)
+        bad = self.watch_query([], routes=[route("r", 200, "info")],
+                               watch=("A",))
+        self.assert_watch_code("INVALID_ROUTE", bad)
+        bad = self.watch_query([], watch=("A",))
+        self.assert_watch_code("INVALID_WATCH_QUERY", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.watch_query(
+            [tx("dup", "A", "B"), tx("dup", "B", "D", ts="bad")])
+        self.assert_watch_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.watch_query([tx("t1", "A", "D", amount=0)])
+        self.assert_watch_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class WatchScoringTests(unittest.TestCase):
+    def watch_with_scoring(self, scoring, **kwargs):
+        transfers = kwargs.pop("transfers", [
+            tx("t1", "A", "B", usd=10000),
+            tx("t2", "B", "D", usd=5000),
+        ])
+        body = {
+            "transfers": transfers,
+            "whale_threshold_usd": 10000,
+            "routes": kwargs.pop("routes", []),
+            "watch_addresses": ["A", "D"],
+            "max_hops": 4,
+        }
+        body.update(kwargs)
+        body["scoring"] = scoring
+        return watch(body)
+
+    def test_scoring_changes_segment_sum(self):
+        data = self.watch_with_scoring(
+            {"value_points_per_ratio": 10, "value_points_cap": 100}
+        )
+        path = next(p for p in data["paths"] if p["path_id"] == "t1>t2")
+        # t1=10、t2=5，合计 15。
+        self.assertEqual(path["score"], 15)
+
+    def test_path_sum_caps_at_100(self):
+        data = self.watch_with_scoring(
+            {"value_points_per_ratio": 1000, "value_points_cap": 100},
+            transfers=[tx("t1", "A", "D", usd=10000)],
+        )
+        self.assertEqual(data["paths"][0]["score"], 100)
+
+    def test_invalid_scoring_after_watch_query(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.watch_with_scoring([])
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_watch_query_error_precedes_scoring(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.watch_with_scoring([], max_hops=0)
+        self.assertEqual(ctx.exception.code, "INVALID_WATCH_QUERY")
+
+
+class WatchCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "watch"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = {
+            "transfers": [tx("t1", "A", "D", usd=1)],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "watch_addresses": ["A", "D"],
+            "max_hops": 3,
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"paths", "alerts"})
+        self.assertEqual(out["data"]["paths"][0]["path_id"], "t1")
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_paths_and_alerts(self):
+        body = {
+            "transfers": [],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "watch_addresses": ["A", "D"],
+            "max_hops": 3,
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"paths": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "watch_addresses": ["A"], "max_hops": 3,
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_WATCH_QUERY"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "watch_addresses": ["A", "D"], "max_hops": 3,
+            "scoring": {"window_seconds": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
         )
 
 
