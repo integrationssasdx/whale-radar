@@ -83,29 +83,13 @@ def _validate_schema(payload):
     threshold = payload["whale_threshold_usd"]
     routes = payload["routes"]
 
-    if not isinstance(transfers, list):
-        raise AnalyzeError("INVALID_INPUT_SCHEMA")
     if not isinstance(routes, list):
         raise AnalyzeError("INVALID_INPUT_SCHEMA")
     # 阈值存在但类型不对属于结构错误；数值范围在后续阶段判定。
     if not _is_number(threshold):
         raise AnalyzeError("INVALID_INPUT_SCHEMA")
 
-    for transfer in transfers:
-        if not isinstance(transfer, dict):
-            raise AnalyzeError("INVALID_INPUT_SCHEMA")
-        for field in TRANSFER_FIELDS:
-            if field not in transfer:
-                raise AnalyzeError("INVALID_INPUT_SCHEMA")
-        for field in ("id", "chain", "asset", "from_address", "to_address"):
-            value = transfer[field]
-            if not isinstance(value, str) or not value:
-                raise AnalyzeError("INVALID_INPUT_SCHEMA")
-        if not isinstance(transfer["timestamp"], str) or not transfer["timestamp"]:
-            raise AnalyzeError("INVALID_INPUT_SCHEMA")
-        for field in ("amount", "usd_value"):
-            if not _is_number(transfer[field]):
-                raise AnalyzeError("INVALID_INPUT_SCHEMA")
+    _validate_transfers(transfers)
 
     for route in routes:
         if not isinstance(route, dict):
@@ -124,6 +108,27 @@ def _validate_schema(payload):
                 raise AnalyzeError("INVALID_INPUT_SCHEMA")
 
     return transfers, float(threshold), routes
+
+
+def _validate_transfers(transfers):
+    """转账列表结构校验，analyze 与 trace 共用。"""
+    if not isinstance(transfers, list):
+        raise AnalyzeError("INVALID_INPUT_SCHEMA")
+    for transfer in transfers:
+        if not isinstance(transfer, dict):
+            raise AnalyzeError("INVALID_INPUT_SCHEMA")
+        for field in TRANSFER_FIELDS:
+            if field not in transfer:
+                raise AnalyzeError("INVALID_INPUT_SCHEMA")
+        for field in ("id", "chain", "asset", "from_address", "to_address"):
+            value = transfer[field]
+            if not isinstance(value, str) or not value:
+                raise AnalyzeError("INVALID_INPUT_SCHEMA")
+        if not isinstance(transfer["timestamp"], str) or not transfer["timestamp"]:
+            raise AnalyzeError("INVALID_INPUT_SCHEMA")
+        for field in ("amount", "usd_value"):
+            if not _is_number(transfer[field]):
+                raise AnalyzeError("INVALID_INPUT_SCHEMA")
 
 
 def _validate_duplicates(transfers):

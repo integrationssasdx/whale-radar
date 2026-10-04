@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
+from whale_radar.tracer import trace
 
 BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -361,6 +362,189 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+
+
+class TraceTests(unittest.TestCase):
+    def query(self, transfers, start="A", end="D", max_hops=4,
+              chain="eth", asset="ETH"):
+        return {
+            "transfers": transfers,
+            "chain": chain,
+            "asset": asset,
+            "start_address": start,
+            "end_address": end,
+            "max_hops": max_hops,
+        }
+
+    def test_direct_and_multi_hop_paths(self):
+        data = trace(self.query([
+            tx("t1", "A", "B", amount=1.0, usd=10),
+            tx("t2", "B", "D", amount=2.0, usd=20),
+            tx("t3", "A", "D", amount=5.0, usd=50),
+        ]))
+        paths = data["paths"]
+        self.assertEqual([p["transfer_ids"] for p in paths], [["t3"], ["t1", "t2"]])
+        direct = paths[0]
+        self.assertEqual(direct["nodes"], ["A", "D"])
+        self.assertEqual(direct["hops"], 1)
+        self.assertEqual(direct["amount"], 5)
+        self.assertEqual(direct["usd_value"], 50)
+        relay = paths[1]
+        self.assertEqual(relay["nodes"], ["A", "B", "D"])
+        self.assertEqual(relay["hops"], 2)
+        self.assertEqual(relay["amount"], 3)
+        self.assertEqual(relay["usd_value"], 30)
+
+    def test_chain_and_asset_must_match_exactly(self):
+        data = trace(self.query([
+            tx("t1", "A", "D", chain="bsc"),
+            tx("t2", "A", "D", asset="USDC"),
+            tx("t3", "A", "D"),
+        ]))
+        self.assertEqual([p["transfer_ids"] for p in data["paths"]], [["t3"]])
+
+    def test_no_path_returns_empty_list(self):
+        data = trace(self.query([tx("t1", "A", "B")], end="Z"))
+        self.assertEqual(data["paths"], [])
+
+    def test_simple_paths_only_no_repeated_addresses(self):
+        # 环 B->C->B 不可用于延长路径；A->B->C->D 是唯一多跳路径。
+        data = trace(self.query([
+            tx("t1", "A", "B"),
+            tx("t2", "B", "C"),
+            tx("t3", "C", "B"),
+            tx("t4", "C", "D"),
+        ]))
+        self.assertEqual(
+            [p["transfer_ids"] for p in data["paths"]], [["t1", "t2", "t4"]]
+        )
+
+    def test_max_hops_limits_depth(self):
+        transfers = [
+            tx("t1", "A", "B"),
+            tx("t2", "B", "C"),
+            tx("t3", "C", "D"),
+        ]
+        data = trace(self.query(transfers, max_hops=2))
+        self.assertEqual(data["paths"], [])
+        data = trace(self.query(transfers, max_hops=3))
+        self.assertEqual(len(data["paths"]), 1)
+
+    def test_parallel_edges_yield_distinct_paths_sorted(self):
+        data = trace(self.query([
+            tx("t2", "A", "D", amount=2.0),
+            tx("t1", "A", "D", amount=1.0),
+        ]))
+        self.assertEqual(
+            [p["transfer_ids"] for p in data["paths"]], [["t1"], ["t2"]]
+        )
+
+    def test_hops_then_transfer_ids_then_nodes_ordering(self):
+        data = trace(self.query([
+            tx("t9", "A", "D"),
+            tx("t1", "A", "B"),
+            tx("t2", "B", "D"),
+            tx("t3", "A", "C"),
+            tx("t4", "C", "D"),
+        ]))
+        self.assertEqual(
+            [p["transfer_ids"] for p in data["paths"]],
+            [["t9"], ["t1", "t2"], ["t3", "t4"]],
+        )
+
+    def test_amount_usd_round10_representation(self):
+        data = trace(self.query([
+            tx("t1", "A", "B", amount=0.1, usd=0.2),
+            tx("t2", "B", "D", amount=0.2, usd=0.1),
+        ]))
+        path = data["paths"][0]
+        self.assertEqual(path["amount"], 0.3)
+        self.assertEqual(path["usd_value"], 0.3)
+
+    def assert_trace_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            trace(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_schema_errors(self):
+        self.assert_trace_code("INVALID_INPUT_SCHEMA", [])
+        self.assert_trace_code("INVALID_INPUT_SCHEMA", {})
+        self.assert_trace_code("INVALID_INPUT_SCHEMA", {"transfers": "x"})
+        bad = self.query([{"id": "t1"}])
+        self.assert_trace_code("INVALID_INPUT_SCHEMA", bad)
+
+    def test_duplicate_id_precedes_value_and_query_errors(self):
+        bad = self.query([tx("dup", "A", "B"), tx("dup", "A", "B", ts="bad")])
+        del bad["chain"]
+        self.assert_trace_code("DUPLICATE_TRANSFER_ID", bad)
+
+    def test_value_error_precedes_query_error(self):
+        bad = self.query([tx("t1", "A", "B", amount=0)])
+        bad["max_hops"] = 0
+        self.assert_trace_code("INVALID_TRANSFER_VALUE", bad)
+        bad = self.query([tx("t1", "A", "B", ts="2026-10-04 10:00:00")])
+        self.assert_trace_code("INVALID_TRANSFER_VALUE", bad)
+        bad = self.query([tx("t1", "A", "B", usd=-1)])
+        self.assert_trace_code("INVALID_TRANSFER_VALUE", bad)
+
+    def test_query_errors(self):
+        base = [tx("t1", "A", "D")]
+        for field in ("chain", "asset", "start_address",
+                      "end_address", "max_hops"):
+            bad = self.query(base)
+            del bad[field]
+            self.assert_trace_code("INVALID_TRACE_QUERY", bad)
+        self.assert_trace_code(
+            "INVALID_TRACE_QUERY", self.query(base) | {"chain": 1}
+        )
+        self.assert_trace_code(
+            "INVALID_TRACE_QUERY", self.query(base) | {"start_address": ""}
+        )
+        self.assert_trace_code(
+            "INVALID_TRACE_QUERY", self.query(base, start="A", end="A")
+        )
+        for bad_hops in (0, 9, 2.5, "3", True):
+            self.assert_trace_code(
+                "INVALID_TRACE_QUERY", self.query(base, max_hops=bad_hops)
+            )
+
+
+class TraceCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "trace"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        payload = {
+            "transfers": [tx("t1", "A", "D", usd=1)],
+            "chain": "eth",
+            "asset": "ETH",
+            "start_address": "A",
+            "end_address": "D",
+            "max_hops": 3,
+        }
+        proc = self.run_cli(json.dumps(payload))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"paths"})
+        self.assertEqual(out["data"]["paths"][0]["transfer_ids"], ["t1"])
+        self.assertEqual(proc.stderr, "")
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_code_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_TRACE_QUERY"}
         )
 
 
