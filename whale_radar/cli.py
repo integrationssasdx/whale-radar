@@ -1,7 +1,9 @@
-"""命令行入口：``whale-radar analyze`` 从 stdin 读 JSON、向 stdout 写 JSON。
+"""命令行入口：``whale-radar analyze`` / ``whale-radar trace`` 从 stdin 读
+JSON、向 stdout 写 JSON。
 
-输入错误不落任何部分报告：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
-结束；成功时退出码 0。全程不联网、不落盘。
+输入错误不落任何部分结果：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
+结束；成功时退出码 0。全程不联网、不落盘。trace 的 stdout 只含路径追踪
+结果，不混入 analyze 的 graph、whales、scores、alerts。
 """
 
 import argparse
@@ -10,12 +12,13 @@ import sys
 
 from . import __version__
 from .analyzer import AnalyzeError, analyze
+from .tracer import TraceError, trace
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="whale-radar",
-        description="链上异常与巨鲸追踪：资金流图、异常打分与告警路由",
+        description="链上异常与巨鲸追踪：资金流图、异常打分、告警路由与资金路径追踪",
     )
     parser.add_argument(
         "--version", action="version", version="whale-radar %s" % __version__
@@ -23,6 +26,9 @@ def build_parser():
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "analyze", help="从 stdin 读取 JSON，分析结果 JSON 写入 stdout"
+    )
+    subparsers.add_parser(
+        "trace", help="从 stdin 读取 JSON，资金路径追踪结果 JSON 写入 stdout"
     )
     return parser
 
@@ -39,13 +45,27 @@ def run_analyze():
     return 0
 
 
+def run_trace():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        raise TraceError("INPUT_NOT_JSON")
+    data = trace(payload)
+    json.dump({"data": data}, sys.stdout, ensure_ascii=False, sort_keys=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command == "analyze":
             return run_analyze()
-    except AnalyzeError as exc:
+        if args.command == "trace":
+            return run_trace()
+    except (AnalyzeError, TraceError) as exc:
         json.dump({"error": exc.code}, sys.stderr, ensure_ascii=False)
         sys.stderr.write("\n")
         return 2
