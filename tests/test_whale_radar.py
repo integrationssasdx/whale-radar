@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
+from whale_radar.ranker import rank
 from whale_radar.tracer import trace
 
 BIN = os.path.join(
@@ -546,6 +547,240 @@ class TraceCliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_TRACE_QUERY"}
         )
+
+
+class RankTests(unittest.TestCase):
+    def test_aggregation_net_and_self_transfer(self):
+        data = rank(payload([
+            tx("o1", "A", "B", usd=100),
+            tx("o2", "A", "B", usd=50),
+            tx("i1", "B", "A", usd=30),
+            tx("s1", "S", "S", usd=90000),
+        ], threshold=10000))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["sent_usd"], 150)
+        self.assertEqual(prof["A"]["received_usd"], 30)
+        self.assertEqual(prof["A"]["net_usd"], 120)
+        # S 自转账：同时计入发起与收到，相反地址为自身。
+        self.assertEqual(prof["S"]["sent_usd"], 90000)
+        self.assertEqual(prof["S"]["received_usd"], 90000)
+        self.assertEqual(prof["S"]["net_usd"], 0)
+        self.assertEqual(prof["S"]["whale_transfers"], 1)
+        self.assertEqual(prof["S"]["counterparties"], 1)
+
+    def test_whale_exposure_touches_both_sides_inclusive(self):
+        data = rank(payload([
+            tx("lo", "A", "B", usd=9999.99),
+            tx("hi", "C", "D", usd=10000),
+        ], threshold=10000))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["whale_transfers"], 0)
+        self.assertEqual(prof["B"]["whale_transfers"], 0)
+        self.assertEqual(prof["C"]["whale_transfers"], 1)
+        self.assertEqual(prof["D"]["whale_transfers"], 1)
+        self.assertEqual(prof["C"]["risk_score"], 40)
+        self.assertEqual(prof["C"]["reasons"], ["WHALE_EXPOSURE"])
+
+    def test_counterparty_distribution(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, usd=1,
+               ts="2026-10-04T10:%02d:00Z" % (i * 10))
+            for i in range(3)
+        ]
+        data = rank(payload(transfers))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertEqual(prof["A"]["counterparties"], 3)
+        self.assertIn("COUNTERPARTY_DISTRIBUTION", prof["A"]["reasons"])
+        self.assertNotIn("COUNTERPARTY_DISTRIBUTION",
+                         prof["r0"]["reasons"])  # 收款方仅 1 个相反地址
+
+    def test_round_trip_both_sides_self_transfer_excluded(self):
+        data = rank(payload([
+            tx("out", "A", "B", amount=7.0, asset="USDC"),
+            tx("back", "B", "A", amount=7.0, asset="USDC",
+               ts="2026-10-04T11:00:00Z"),
+            tx("self", "C", "C", amount=7.0, asset="USDC",
+               ts="2026-10-04T11:30:00Z"),
+        ]))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertIn("ROUND_TRIP_ACTIVITY", prof["A"]["reasons"])
+        self.assertIn("ROUND_TRIP_ACTIVITY", prof["B"]["reasons"])
+        self.assertNotIn("ROUND_TRIP_ACTIVITY", prof["C"]["reasons"])
+
+    def test_round_trip_requires_same_asset_equal_amount(self):
+        data = rank(payload([
+            tx("out", "A", "B", amount=7.0, asset="USDC"),
+            tx("back", "B", "A", amount=8.0, asset="USDC",
+               ts="2026-10-04T11:00:00Z"),
+        ]))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertNotIn("ROUND_TRIP_ACTIVITY", prof["A"]["reasons"])
+
+    def test_burst_closed_window_from_send_times_only(self):
+        transfers = [
+            tx("t1", "A", "x0", usd=1),
+            tx("t2", "A", "x1", usd=1, ts="2026-10-04T10:30:00Z"),
+            tx("t3", "A", "x2", usd=1, ts="2026-10-04T10:45:00Z"),
+            tx("t4", "A", "x3", usd=1, ts="2026-10-04T10:59:00Z"),
+            tx("t5", "A", "x4", usd=1, ts="2026-10-04T11:00:00Z"),
+        ]
+        data = rank(payload(transfers))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertIn("BURST_ACTIVITY", prof["A"]["reasons"])
+        # 收款时间不参与 burst：x0 等地址均无 BURST。
+        self.assertNotIn("BURST_ACTIVITY", prof["x0"]["reasons"])
+
+    def test_burst_needs_five_inside_window(self):
+        transfers = [
+            tx("t1", "A", "x0", usd=1),
+            tx("t2", "A", "x1", usd=1, ts="2026-10-04T10:20:00Z"),
+            tx("t3", "A", "x2", usd=1, ts="2026-10-04T10:40:00Z"),
+            tx("t4", "A", "x3", usd=1, ts="2026-10-04T11:00:00Z"),
+            tx("t5", "A", "x4", usd=1, ts="2026-10-04T11:20:00Z"),
+        ]
+        # 10:00 起 3600s 闭区间内只有 4 笔；11:20 的第 5 笔在窗口外。
+        data = rank(payload(transfers))
+        prof = {p["address"]: p for p in data["profiles"]}
+        self.assertNotIn("BURST_ACTIVITY", prof["A"]["reasons"])
+
+    def test_score_sum_and_clamp_and_reason_order(self):
+        transfers = [
+            tx("w", "A", "B", amount=3.0, asset="ETH", usd=100000),
+            tx("c2", "A", "C", usd=1, ts="2026-10-04T10:05:00Z"),
+            tx("c3", "A", "D", usd=1, ts="2026-10-04T10:10:00Z"),
+            tx("b2", "B", "A", amount=3.0, asset="ETH", usd=1,
+               ts="2026-10-04T10:15:00Z"),
+            tx("c4", "A", "E", usd=1, ts="2026-10-04T10:20:00Z"),
+            tx("c5", "A", "F", usd=1, ts="2026-10-04T10:25:00Z"),
+        ]
+        data = rank(payload(transfers, threshold=10000))
+        prof = {p["address"]: p for p in data["profiles"]}
+        # 40+25+20+15=100，截断在 100。
+        self.assertEqual(prof["A"]["risk_score"], 100)
+        self.assertEqual(
+            prof["A"]["reasons"],
+            ["WHALE_EXPOSURE", "COUNTERPARTY_DISTRIBUTION",
+             "ROUND_TRIP_ACTIVITY", "BURST_ACTIVITY"],
+        )
+
+    def test_profiles_sorted_score_desc_address_asc(self):
+        data = rank(payload([
+            tx("w1", "Z", "x1", usd=100000),
+            tx("w2", "A", "x2", usd=100000),
+            tx("w3", "M", "x3", usd=100000),
+        ], threshold=10000))
+        self.assertEqual(
+            [(p["address"], p["risk_score"]) for p in data["profiles"][:3]],
+            [("A", 40), ("M", 40), ("Z", 40)],
+        )
+
+    def test_alerts_one_per_route_address_and_sorting(self):
+        routes = [
+            route("r2", 40, "warning", chains=("eth",), target="email"),
+            route("r1", 40, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+        ]
+        data = rank(payload([
+            tx("w1", "A", "B", usd=50000, chain="eth", asset="ETH"),
+            tx("w2", "A", "B", usd=50000, chain="eth", asset="ETH",
+               ts="2026-10-04T10:30:00Z"),
+            tx("w3", "C", "D", usd=50000, chain="btc", asset="BTC"),
+        ], threshold=10000, routes=routes))
+        alerts = data["alerts"]
+        # 每对 (route, address) 至多一项；多笔匹配不重复。
+        self.assertEqual(
+            [(a["route_id"], a["address"]) for a in alerts],
+            [("r1", "A"), ("r1", "B"),
+             ("r2", "A"), ("r2", "B")],
+        )
+        first = alerts[0]
+        self.assertEqual(set(first),
+                         {"route_id", "address", "severity",
+                          "reason", "target"})
+        self.assertEqual(first["target"], "pager")
+        # C/D 的触及转账在 btc 上，不命中 eth 路由。
+        self.assertFalse(
+            any(a["address"] in ("C", "D") for a in alerts)
+        )
+
+    def test_alert_match_requires_single_transfer_hit_both(self):
+        data = rank(payload([
+            tx("e", "P", "Q", usd=50000, chain="eth", asset="ETH"),
+            tx("u", "P", "Q", usd=50000, chain="bsc", asset="USDC"),
+        ], threshold=10000, routes=[
+            route("r", 40, "info", chains=("eth",), assets=("USDC",))
+        ]))
+        self.assertEqual(data["alerts"], [])
+
+    def test_alert_min_score_inclusive(self):
+        data = rank(payload([tx("w", "A", "B", usd=10000)], threshold=10000,
+                            routes=[route("r", 40, "info")]))
+        self.assertEqual([a["address"] for a in data["alerts"]], ["A", "B"])
+
+    def test_alert_star_matches_any(self):
+        data = rank(payload([
+            tx("w", "A", "B", usd=50000, chain="eth", asset="ETH"),
+        ], threshold=10000, routes=[route("r", 40, "info")]))
+        self.assertEqual(len(data["alerts"]), 2)
+
+    def test_error_codes_reuse_analyze_pipeline(self):
+        def assert_code(code, obj):
+            with self.assertRaises(AnalyzeError) as ctx:
+                rank(obj)
+            self.assertEqual(ctx.exception.code, code)
+
+        assert_code("INVALID_INPUT_SCHEMA", {"transfers": []})
+        assert_code(
+            "INVALID_INPUT_SCHEMA",
+            payload([{"id": "t1"}]),
+        )
+        assert_code(
+            "DUPLICATE_TRANSFER_ID",
+            payload([tx("dup", "A", "B"),
+                     tx("dup", "A", "B", ts="bad")]),
+        )
+        assert_code(
+            "INVALID_TRANSFER_VALUE",
+            payload([tx("t", "A", "B", amount=0)]),
+        )
+        assert_code(
+            "INVALID_THRESHOLD",
+            payload([], threshold=0, routes=[route("r", 50, "info")]),
+        )
+        assert_code(
+            "INVALID_ROUTE",
+            payload([], routes=[route("r", 101, "info")]),
+        )
+
+
+class RankCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "rank"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(
+            payload([tx("t1", "A", "B", usd=10000)])))
+        self.assertEqual(proc.returncode == 0, True)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"profiles", "alerts"})
+        self.assertEqual(proc.stderr, "")
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INPUT_NOT_JSON"})
+
+    def test_error_code_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_INPUT_SCHEMA"})
 
 
 if __name__ == "__main__":

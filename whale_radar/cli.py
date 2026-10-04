@@ -1,4 +1,4 @@
-"""命令行入口：``whale-radar analyze`` / ``whale-radar trace``
+"""命令行入口：``whale-radar analyze`` / ``trace`` / ``rank``
 从 stdin 读 JSON、向 stdout 写 JSON。
 
 输入错误不落任何部分报告：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
@@ -11,6 +11,7 @@ import sys
 
 from . import __version__
 from .analyzer import AnalyzeError, analyze
+from .ranker import rank
 from .tracer import trace
 
 
@@ -28,6 +29,9 @@ def build_parser():
     )
     subparsers.add_parser(
         "trace", help="从 stdin 读取 JSON，资金路径追踪结果 JSON 写入 stdout"
+    )
+    subparsers.add_parser(
+        "rank", help="从 stdin 读取 JSON，巨鲸画像与聚合告警 JSON 写入 stdout"
     )
     return parser
 
@@ -52,6 +56,8 @@ def main(argv=None):
             return _run(analyze)
         if args.command == "trace":
             return _run(trace)
+        if args.command == "rank":
+            return _run(rank)
     except AnalyzeError as exc:
         json.dump({"error": exc.code}, sys.stderr, ensure_ascii=False)
         sys.stderr.write("\n")
