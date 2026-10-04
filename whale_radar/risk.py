@@ -12,13 +12,14 @@ VALUE BURST FAN_OUT ROUND_TRIP 顺序去重。
 
 INPUT_NOT_JSON -> INVALID_INPUT_SCHEMA -> DUPLICATE_TRANSFER_ID
 -> INVALID_TRANSFER_VALUE -> INVALID_THRESHOLD -> INVALID_ROUTE
--> INVALID_TRACE_QUERY
+-> INVALID_TRACE_QUERY -> INVALID_SCORING_CONFIG
 """
 
 from __future__ import annotations
 
 from .analyzer import (
     _match,
+    _resolve_scoring,
     _round10,
     _score_transfers,
     _validate_duplicates,
@@ -32,10 +33,10 @@ from .tracer import _find_paths, _validate_query
 REASON_ORDER = ("VALUE", "BURST", "FAN_OUT", "ROUND_TRIP")
 
 
-def _risk_paths(transfers, threshold, chain, asset, start, end, max_hops):
+def _risk_paths(transfers, threshold, chain, asset, start, end, max_hops, scoring):
     """在 trace 拓扑路径上附加逐段合并的 analyze 分值、原因与 path_id。"""
     scores_by_id = {
-        item["id"]: item for item in _score_transfers(transfers, threshold)
+        item["id"]: item for item in _score_transfers(transfers, threshold, scoring)
     }
     paths = _find_paths(transfers, chain, asset, start, end, max_hops)
 
@@ -101,9 +102,10 @@ def trace_risk(payload):
     _validate_threshold(threshold)
     _validate_routes(routes)
     chain, asset, start, end, max_hops = _validate_query(payload)
+    scoring = _resolve_scoring(payload)
 
     paths = _risk_paths(
-        transfers, threshold, chain, asset, start, end, max_hops
+        transfers, threshold, chain, asset, start, end, max_hops, scoring
     )
     alerts = _risk_alerts(paths, routes, chain, asset)
     return {"paths": paths, "alerts": alerts}

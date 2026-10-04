@@ -7,6 +7,7 @@ routes），输出 data 仅含 profiles、alerts 两个数组。
 
 INPUT_NOT_JSON -> INVALID_INPUT_SCHEMA -> DUPLICATE_TRANSFER_ID
 -> INVALID_TRANSFER_VALUE -> INVALID_THRESHOLD -> INVALID_ROUTE
+-> INVALID_SCORING_CONFIG
 """
 
 from __future__ import annotations
@@ -14,9 +15,9 @@ from __future__ import annotations
 from datetime import timedelta
 
 from .analyzer import (
-    BURST_COUNT,
-    WINDOW_SECONDS,
+    SCORING_DEFAULTS,
     _match,
+    _resolve_scoring,
     _round10,
     _validate_duplicates,
     _validate_routes,
@@ -25,20 +26,16 @@ from .analyzer import (
     _validate_values,
 )
 
-WHALE_POINTS = 40
-COUNTERPARTY_COUNT = 3
-COUNTERPARTY_POINTS = 25
-ROUND_TRIP_POINTS = 20
-BURST_POINTS = 15
-
 REASON_WHALE = "WHALE_EXPOSURE"
 REASON_COUNTERPARTY = "COUNTERPARTY_DISTRIBUTION"
 REASON_ROUND_TRIP = "ROUND_TRIP_ACTIVITY"
 REASON_BURST = "BURST_ACTIVITY"
 
 
-def _build_profiles(transfers, threshold):
+def _build_profiles(transfers, threshold, scoring=None):
     """按 from_address/to_address 去重聚合地址画像并打分。"""
+    if scoring is None:
+        scoring = SCORING_DEFAULTS
     stats = {}
 
     def node(address):
@@ -91,10 +88,10 @@ def _build_profiles(transfers, threshold):
         reasons = []
         score = 0
         if item["whale_transfers"] > 0:
-            score += WHALE_POINTS
+            score += scoring["whale_points"]
             reasons.append(REASON_WHALE)
-        if len(item["counterparties"]) >= COUNTERPARTY_COUNT:
-            score += COUNTERPARTY_POINTS
+        if len(item["counterparties"]) >= scoring["counterparty_count"]:
+            score += scoring["counterparty_points"]
             reasons.append(REASON_COUNTERPARTY)
 
         has_round_trip = any(
@@ -104,21 +101,22 @@ def _build_profiles(transfers, threshold):
             for frm, to, asset, amount in direction_index
         )
         if has_round_trip:
-            score += ROUND_TRIP_POINTS
+            score += scoring["address_round_trip_points"]
             reasons.append(REASON_ROUND_TRIP)
 
         sent_at = sorted(item["sent_at"])
+        window = timedelta(seconds=scoring["window_seconds"])
         has_burst = any(
             sum(
                 1
                 for other in sent_at
-                if start <= other <= start + timedelta(seconds=WINDOW_SECONDS)
+                if start <= other <= start + window
             )
-            >= BURST_COUNT
+            >= scoring["burst_count"]
             for start in sent_at
         )
         if has_burst:
-            score += BURST_POINTS
+            score += scoring["address_burst_points"]
             reasons.append(REASON_BURST)
 
         score = max(0, min(100, score))
@@ -183,7 +181,8 @@ def rank(payload):
     transfers = _validate_values(transfers_raw)
     _validate_threshold(threshold)
     _validate_routes(routes)
+    scoring = _resolve_scoring(payload)
 
-    profiles = _build_profiles(transfers, threshold)
+    profiles = _build_profiles(transfers, threshold, scoring)
     alerts = _rank_alerts(transfers, routes, profiles)
     return {"profiles": profiles, "alerts": alerts}

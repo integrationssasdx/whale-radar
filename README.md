@@ -48,3 +48,25 @@ stdout 为空，退出码 2。
 - `whale-radar rank`：高风险巨鲸地址画像（profiles）与按 route/地址
   聚合的告警（alerts）。输入同 analyze（transfers、whale_threshold_usd、
   routes），成功时 data 仅含 `profiles`、`alerts` 两个数组。
+
+## 可配置异常分值
+
+`analyze`、`trace-risk`、`rank` 的输入可额外携带一个 `scoring` 对象调整
+打分参数；省略时保持基线结果，`trace` 不读取该字段。`scoring` 可部分
+提供，缺失字段沿用基线。字段与取值范围：
+
+- `window_seconds`、`burst_count`、`fan_out_recipients`、`counterparty_count`：
+  1 到 10000 的整数。
+- `value_points_per_ratio`：0 到 1000 的有限数。
+- `value_points_cap`、`transfer_burst_points`、`fan_out_points`、
+  `round_trip_points`、`whale_points`、`counterparty_points`、
+  `address_round_trip_points`、`address_burst_points`：0 到 100 的有限数
+  （`value_points_cap` 不超过 100）。
+
+逐笔基础分为 `usd_value / whale_threshold_usd * value_points_per_ratio`
+并截到 `value_points_cap`，突发、扇出、往返命中各加对应分值，总分限制
+0 到 100，窗口为闭区间；地址画像沿用既有原因与地址分值，总分同样限制
+0 到 100。`scoring` 不是对象、含未知字段，或字段类型、范围不合法时，
+三个命令在既有全部校验之后向 stderr 输出
+`{"error": "INVALID_SCORING_CONFIG"}` 并换行，stdout 为空，退出码 2，
+不落任何部分报告。

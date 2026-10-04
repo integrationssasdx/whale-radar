@@ -5,6 +5,7 @@
 
 INPUT_NOT_JSON -> INVALID_INPUT_SCHEMA -> DUPLICATE_TRANSFER_ID
 -> INVALID_TRANSFER_VALUE -> INVALID_THRESHOLD -> INVALID_ROUTE
+-> INVALID_SCORING_CONFIG
 """
 
 from __future__ import annotations
@@ -21,6 +22,50 @@ BURST_POINTS = 25.0
 FAN_OUT_RECIPIENTS = 3
 FAN_OUT_POINTS = 20.0
 ROUND_TRIP_POINTS = 15.0
+
+# 可配置异常分值的基线：省略 scoring 或缺省字段时沿用。
+SCORING_DEFAULTS = {
+    "window_seconds": WINDOW_SECONDS,
+    "burst_count": BURST_COUNT,
+    "fan_out_recipients": FAN_OUT_RECIPIENTS,
+    "value_points_per_ratio": VALUE_POINTS_PER_RATIO,
+    "value_points_cap": VALUE_POINTS_CAP,
+    "transfer_burst_points": BURST_POINTS,
+    "fan_out_points": FAN_OUT_POINTS,
+    "round_trip_points": ROUND_TRIP_POINTS,
+    "whale_points": 40,
+    "counterparty_count": 3,
+    "counterparty_points": 25,
+    "address_round_trip_points": 20,
+    "address_burst_points": 15,
+}
+
+# 窗口与数量阈值：1..10000 整数。
+SCORING_INT_FIELDS = (
+    "window_seconds",
+    "burst_count",
+    "fan_out_recipients",
+    "counterparty_count",
+)
+SCORING_INT_MIN = 1
+SCORING_INT_MAX = 10000
+
+# 逐笔基础分系数：0..1000 有限数。
+SCORING_RATIO_FIELDS = ("value_points_per_ratio",)
+SCORING_RATIO_MAX = 1000
+
+# 其余分值：0..100 有限数（value_points_cap 亦不超过 100）。
+SCORING_POINTS_FIELDS = (
+    "value_points_cap",
+    "transfer_burst_points",
+    "fan_out_points",
+    "round_trip_points",
+    "whale_points",
+    "counterparty_points",
+    "address_round_trip_points",
+    "address_burst_points",
+)
+SCORING_POINTS_MAX = 100
 
 REASON_VALUE = "VALUE"
 REASON_BURST = "BURST"
@@ -193,6 +238,46 @@ def _validate_routes(routes):
             raise AnalyzeError("INVALID_ROUTE")
 
 
+def _resolve_scoring(payload):
+    """解析可选的 scoring 配置：省略时返回基线，部分提供时缺省项沿用基线。
+
+    scoring 不是对象、含未知字段，或字段类型、范围不合法时抛出
+    ``INVALID_SCORING_CONFIG``；该校验在既有全部校验之后触发。
+    """
+    if "scoring" not in payload:
+        return dict(SCORING_DEFAULTS)
+    scoring = payload["scoring"]
+    if not isinstance(scoring, dict):
+        raise AnalyzeError("INVALID_SCORING_CONFIG")
+    config = dict(SCORING_DEFAULTS)
+    for key, value in scoring.items():
+        if key not in SCORING_DEFAULTS:
+            raise AnalyzeError("INVALID_SCORING_CONFIG")
+        if key in SCORING_INT_FIELDS:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not (SCORING_INT_MIN <= value <= SCORING_INT_MAX)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+        elif key in SCORING_RATIO_FIELDS:
+            if (
+                not _is_number(value)
+                or not math.isfinite(float(value))
+                or not (0 <= value <= SCORING_RATIO_MAX)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+        else:
+            if (
+                not _is_number(value)
+                or not math.isfinite(float(value))
+                or not (0 <= value <= SCORING_POINTS_MAX)
+            ):
+                raise AnalyzeError("INVALID_SCORING_CONFIG")
+        config[key] = value
+    return config
+
+
 def _build_graph(transfers):
     nodes = {}
     edges = {}
@@ -268,7 +353,9 @@ def _round10(value):
     return int(rounded) if rounded.is_integer() else rounded
 
 
-def _score_transfers(transfers, threshold):
+def _score_transfers(transfers, threshold, scoring=None):
+    if scoring is None:
+        scoring = SCORING_DEFAULTS
     # 反向、同资产、等 amount 的转账索引：(to, from, asset, amount) -> id 集合
     reverse_index = {}
     for transfer in transfers:
@@ -286,25 +373,29 @@ def _score_transfers(transfers, threshold):
         total = 0.0
 
         value_points = min(
-            float(transfer["usd_value"]) / threshold * VALUE_POINTS_PER_RATIO,
-            VALUE_POINTS_CAP,
+            float(transfer["usd_value"]) / threshold
+            * scoring["value_points_per_ratio"],
+            scoring["value_points_cap"],
         )
         if value_points > 0:
             total += value_points
             reasons.append(REASON_VALUE)
 
-        window_end = transfer["timestamp"] + timedelta(seconds=WINDOW_SECONDS)
+        window_end = transfer["timestamp"] + timedelta(
+            seconds=scoring["window_seconds"]
+        )
         window = [
             other
             for other in transfers
             if other["from_address"] == transfer["from_address"]
             and transfer["timestamp"] <= other["timestamp"] <= window_end
         ]
-        if len(window) >= BURST_COUNT:
-            total += BURST_POINTS
+        if len(window) >= scoring["burst_count"]:
+            total += scoring["transfer_burst_points"]
             reasons.append(REASON_BURST)
-        if len({other["to_address"] for other in window}) >= FAN_OUT_RECIPIENTS:
-            total += FAN_OUT_POINTS
+        recipients = {other["to_address"] for other in window}
+        if len(recipients) >= scoring["fan_out_recipients"]:
+            total += scoring["fan_out_points"]
             reasons.append(REASON_FAN_OUT)
 
         reverse_key = (
@@ -318,7 +409,7 @@ def _score_transfers(transfers, threshold):
             and reverse_key in reverse_index
         )
         if is_round_trip:
-            total += ROUND_TRIP_POINTS
+            total += scoring["round_trip_points"]
             reasons.append(REASON_ROUND_TRIP)
 
         score = max(0.0, min(100.0, total))
@@ -369,6 +460,7 @@ def analyze(payload):
     transfers = _validate_values(transfers_raw)
     _validate_threshold(threshold)
     _validate_routes(routes)
+    scoring = _resolve_scoring(payload)
 
     graph = _build_graph(transfers)
     whales = [
@@ -382,7 +474,7 @@ def analyze(payload):
             key=lambda transfer: transfer["id"],
         )
     ]
-    scores = _score_transfers(transfers, threshold)
+    scores = _score_transfers(transfers, threshold, scoring)
     scores_by_id = {item["id"]: item for item in scores}
     alerts = _route_alerts(transfers, routes, scores_by_id)
 
