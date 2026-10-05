@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.converge import converge
+from whale_radar.cycles import cycles
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
 from whale_radar.tracer import trace
@@ -2131,6 +2132,466 @@ class ConvergeCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+
+class CycleTests(unittest.TestCase):
+    def cycle_query(self, transfers, routes=None, threshold=10000.0,
+                    max_hops=8, min_usd_value=0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["cycle_query"] = {
+            "max_hops": max_hops,
+            "min_usd_value": min_usd_value,
+        }
+        return result
+
+    def test_two_hop_round_trip(self):
+        data = cycles(self.cycle_query([
+            tx("out", "A", "B", usd=50000),
+            tx("back", "B", "A", usd=50000, ts="2026-10-04T11:00:00Z"),
+        ]))
+        self.assertEqual(set(data), {"cycles", "alerts"})
+        self.assertEqual(len(data["cycles"]), 1)
+        cycle = data["cycles"][0]
+        self.assertEqual(
+            set(cycle),
+            {"transfer_ids", "cycle_id", "nodes", "hops", "chain",
+             "asset", "amount", "usd_value", "score", "reason"},
+        )
+        self.assertEqual(cycle["transfer_ids"], ["out", "back"])
+        self.assertEqual(cycle["cycle_id"], "out>back")
+        self.assertEqual(cycle["nodes"], ["A", "B", "A"])
+        self.assertEqual(cycle["hops"], 2)
+        self.assertEqual(cycle["chain"], "eth")
+        self.assertEqual(cycle["asset"], "ETH")
+        self.assertEqual(cycle["amount"], 2)
+        self.assertEqual(cycle["usd_value"], 100000)
+        # 每段 40 VALUE + 15 ROUND_TRIP = 55，合计 110 截到 100。
+        self.assertEqual(cycle["score"], 100)
+        self.assertEqual(cycle["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_triangle_starts_at_lexicographically_smallest_node(self):
+        data = cycles(self.cycle_query([
+            tx("ab", "A", "B", usd=10000),
+            tx("bc", "B", "C", usd=10000, ts="2026-10-04T10:10:00Z"),
+            tx("ca", "C", "A", usd=10000, ts="2026-10-04T10:20:00Z"),
+        ]))
+        self.assertEqual(len(data["cycles"]), 1)
+        cycle = data["cycles"][0]
+        self.assertEqual(cycle["transfer_ids"], ["ab", "bc", "ca"])
+        self.assertEqual(cycle["cycle_id"], "ab>bc>ca")
+        self.assertEqual(cycle["nodes"], ["A", "B", "C", "A"])
+        self.assertEqual(cycle["hops"], 3)
+        # 20*3 = 60。
+        self.assertEqual(cycle["score"], 60)
+        self.assertEqual(cycle["reason"], ["VALUE"])
+
+    def test_reverse_direction_is_a_distinct_edge_sequence(self):
+        data = cycles(self.cycle_query([
+            tx("ab", "A", "B", usd=10000),
+            tx("bc", "B", "C", usd=10000, ts="2026-10-04T10:10:00Z"),
+            tx("ca", "C", "A", usd=10000, ts="2026-10-04T10:20:00Z"),
+            tx("ac", "A", "C", usd=10000, ts="2026-10-04T11:00:00Z"),
+            tx("cb", "C", "B", usd=10000, ts="2026-10-04T11:10:00Z"),
+            tx("ba", "B", "A", usd=10000, ts="2026-10-04T11:20:00Z"),
+        ]))
+        ids = {c["cycle_id"] for c in data["cycles"]}
+        # 两个方向的 3 跳回路，以及三对反向边形成的 2 跳回路，均保留。
+        self.assertIn("ab>bc>ca", ids)
+        self.assertIn("ac>cb>ba", ids)
+        self.assertEqual(
+            ids & {"ab>ba", "ac>ca", "bc>cb"},
+            {"ab>ba", "ac>ca", "bc>cb"},
+        )
+        reversed_cycle = next(c for c in data["cycles"]
+                              if c["cycle_id"] == "ac>cb>ba")
+        self.assertEqual(reversed_cycle["nodes"], ["A", "C", "B", "A"])
+
+    def test_parallel_edges_keep_every_edge_sequence(self):
+        data = cycles(self.cycle_query([
+            tx("t1", "A", "B", amount=1.0, usd=10000),
+            tx("t2", "B", "A", amount=1.0, usd=10000,
+               ts="2026-10-04T11:00:00Z"),
+            tx("t3", "A", "B", amount=2.0, usd=10000,
+               ts="2026-10-04T12:00:00Z"),
+            tx("t4", "B", "A", amount=2.0, usd=10000,
+               ts="2026-10-04T13:00:00Z"),
+        ]))
+        # 仅 t1/t2 与 t3/t4 互为等 amount 反向转账；但不同边序列全部保留。
+        self.assertEqual(
+            sorted(c["cycle_id"] for c in data["cycles"]),
+            ["t1>t2", "t1>t4", "t3>t2", "t3>t4"],
+        )
+        for cycle in data["cycles"]:
+            self.assertEqual(cycle["nodes"], ["A", "B", "A"])
+
+    def test_cycles_stay_within_same_chain_and_asset(self):
+        data = cycles(self.cycle_query([
+            tx("a", "A", "B", chain="eth", asset="ETH"),
+            tx("b", "B", "A", chain="bsc", asset="ETH",
+               ts="2026-10-04T11:00:00Z"),
+            tx("c", "A", "B", chain="eth", asset="USDC",
+               ts="2026-10-04T12:00:00Z"),
+        ]))
+        self.assertEqual(data["cycles"], [])
+
+    def test_self_transfer_never_a_cycle(self):
+        data = cycles(self.cycle_query([
+            tx("s", "A", "A", usd=99999),
+        ]))
+        self.assertEqual(data["cycles"], [])
+
+    def test_max_hops_limits_cycle_length(self):
+        triangle = [
+            tx("ab", "A", "B", usd=10000),
+            tx("bc", "B", "C", usd=10000, ts="2026-10-04T10:10:00Z"),
+            tx("ca", "C", "A", usd=10000, ts="2026-10-04T10:20:00Z"),
+        ]
+        self.assertEqual(cycles(self.cycle_query(triangle, max_hops=2))["cycles"],
+                         [])
+        data = cycles(self.cycle_query(triangle, max_hops=3))
+        self.assertEqual(
+            [c["cycle_id"] for c in data["cycles"]], ["ab>bc>ca"]
+        )
+
+    def test_four_hop_cycle(self):
+        data = cycles(self.cycle_query([
+            tx("ab", "A", "B", usd=10000),
+            tx("bc", "B", "C", usd=10000, ts="2026-10-04T10:10:00Z"),
+            tx("cd", "C", "D", usd=10000, ts="2026-10-04T10:20:00Z"),
+            tx("da", "D", "A", usd=10000, ts="2026-10-04T10:30:00Z"),
+        ]))
+        self.assertEqual(
+            [c["cycle_id"] for c in data["cycles"]], ["ab>bc>cd>da"]
+        )
+        self.assertEqual(data["cycles"][0]["nodes"], ["A", "B", "C", "D", "A"])
+
+    def test_min_usd_value_filter_inclusive(self):
+        transfers = [
+            tx("out", "A", "B", usd=100),
+            tx("back", "B", "A", usd=100, ts="2026-10-04T11:00:00Z"),
+        ]
+        self.assertEqual(
+            cycles(self.cycle_query(transfers, min_usd_value=201))["cycles"],
+            [],
+        )
+        data = cycles(self.cycle_query(transfers, min_usd_value=200))
+        self.assertEqual(len(data["cycles"]), 1)
+
+    def test_cycles_sorted_score_desc_chain_asset_cycle_id(self):
+        transfers = [
+            tx("e1", "A", "B", usd=50000, chain="eth", asset="ETH"),
+            tx("e2", "B", "A", usd=50000, chain="eth", asset="ETH",
+               ts="2026-10-04T11:00:00Z"),
+            tx("s1", "A", "B", usd=50000, chain="bsc", asset="BNB",
+               ts="2026-10-04T12:00:00Z"),
+            tx("s2", "B", "A", usd=50000, chain="bsc", asset="BNB",
+               ts="2026-10-04T13:00:00Z"),
+        ]
+        # 同分：chain 升序（bsc 在 eth 前）。
+        self.assertEqual(
+            [(c["chain"], c["asset"], c["cycle_id"])
+             for c in cycles(self.cycle_query(transfers))["cycles"]],
+            [("bsc", "BNB", "s1>s2"), ("eth", "ETH", "e1>e2")],
+        )
+
+    def test_cycle_id_tie_break_ascending(self):
+        data = cycles(self.cycle_query([
+            tx("z1", "A", "B", usd=0),
+            tx("z2", "B", "A", usd=0, ts="2026-10-04T11:00:00Z"),
+            tx("a1", "A", "C", usd=0, ts="2026-10-04T12:00:00Z"),
+            tx("a2", "C", "A", usd=0, ts="2026-10-04T13:00:00Z"),
+        ]))
+        # 两组 2 跳反向等 amount 转账，每段 15 分，合计 30；cycle_id 升序。
+        self.assertEqual(
+            [c["cycle_id"] for c in data["cycles"]],
+            ["a1>a2", "z1>z2"],
+        )
+
+    def test_amount_usd_round10_representation(self):
+        data = cycles(self.cycle_query([
+            tx("a", "A", "B", amount=0.1, usd=0.2),
+            tx("b", "B", "A", amount=0.2, usd=0.1,
+               ts="2026-10-04T11:00:00Z"),
+        ]))
+        cycle = data["cycles"][0]
+        self.assertEqual(cycle["amount"], 0.3)
+        self.assertEqual(cycle["usd_value"], 0.3)
+
+    def test_reason_merged_dedup_in_fixed_order(self):
+        data = cycles(self.cycle_query([
+            tx("out", "A", "B", usd=50000),
+            tx("back", "B", "A", usd=0, ts="2026-10-04T11:00:00Z"),
+        ]))
+        cycle = data["cycles"][0]
+        # out 有 VALUE/ROUND_TRIP，back 仅 ROUND_TRIP；合并去重且固定顺序。
+        self.assertEqual(cycle["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_empty_cycles_keep_arrays(self):
+        data = cycles(self.cycle_query([tx("t", "A", "B")]))
+        self.assertEqual(data, {"cycles": [], "alerts": []})
+
+    def test_non_ascii_preserved(self):
+        data = cycles(self.cycle_query([
+            tx("转甲", "地址甲", "地址乙", usd=10000),
+            tx("转乙", "地址乙", "地址甲", usd=10000,
+               ts="2026-10-04T11:00:00Z"),
+        ]))
+        cycle = data["cycles"][0]
+        self.assertEqual(cycle["nodes"], ["地址乙", "地址甲", "地址乙"])
+        self.assertEqual(cycle["cycle_id"], "转乙>转甲")
+
+    def test_alerts_one_per_route_cycle_and_sorted(self):
+        routes = [
+            route("r2", 60, "warning", chains=("eth",), target="email"),
+            route("r1", 60, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+            route("r-btc", 0, "info", chains=("btc",), target="x"),
+        ]
+        data = cycles(self.cycle_query([
+            tx("ab", "A", "B", usd=10000),
+            tx("bc", "B", "C", usd=10000, ts="2026-10-04T10:10:00Z"),
+            tx("ca", "C", "A", usd=10000, ts="2026-10-04T10:20:00Z"),
+        ], routes=routes))
+        alerts = data["alerts"]
+        self.assertEqual(
+            [(a["route_id"], a["cycle_id"]) for a in alerts],
+            [("r1", "ab>bc>ca"), ("r2", "ab>bc>ca")],
+        )
+        first = alerts[0]
+        self.assertEqual(
+            set(first),
+            {"route_id", "cycle_id", "chain", "asset", "severity",
+             "score", "reason", "target"},
+        )
+        self.assertEqual(first["chain"], "eth")
+        self.assertEqual(first["asset"], "ETH")
+        self.assertEqual(first["severity"], "critical")
+        self.assertEqual(first["target"], "pager")
+        self.assertEqual(first["score"], 60)
+        self.assertEqual(first["reason"], ["VALUE"])
+
+    def test_alert_min_score_boundary_inclusive(self):
+        data = cycles(self.cycle_query(
+            [tx("a", "A", "B", usd=10000),
+             tx("b", "B", "A", usd=10000, ts="2026-10-04T11:00:00Z")],
+            routes=[route("r", 70, "info")],
+        ))
+        # 每段 20 VALUE + 15 ROUND_TRIP = 35，合计 70，恰好命中。
+        self.assertEqual(
+            [(a["route_id"], a["cycle_id"]) for a in data["alerts"]],
+            [("r", "a>b")],
+        )
+
+    def test_alert_chain_asset_star_and_mismatch(self):
+        data = cycles(self.cycle_query(
+            [tx("a", "A", "B", usd=50000),
+             tx("b", "B", "A", usd=50000, ts="2026-10-04T11:00:00Z")],
+            routes=[route("r", 0, "info", assets=("BTC",))],
+        ))
+        self.assertEqual(data["alerts"], [])
+
+    def assert_cycle_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            cycles(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_cycle_query_errors(self):
+        base = [tx("a", "A", "B"), tx("b", "B", "A")]
+        # 缺失 cycle_query 整体或任一字段。
+        self.assert_cycle_code("INVALID_CYCLE_QUERY", payload(base))
+        for field in ("max_hops", "min_usd_value"):
+            bad = self.cycle_query(base)
+            del bad["cycle_query"][field]
+            self.assert_cycle_code("INVALID_CYCLE_QUERY", bad)
+        # 未知字段与非对象。
+        bad = self.cycle_query(base)
+        bad["cycle_query"]["unknown"] = 1
+        self.assert_cycle_code("INVALID_CYCLE_QUERY", bad)
+        for raw in ([], "x", 1, None, True):
+            bad = self.cycle_query(base)
+            bad["cycle_query"] = raw
+            self.assert_cycle_code("INVALID_CYCLE_QUERY", bad)
+        # max_hops：2..8 整数。
+        for bad_value in (0, 1, 9, 2.0, 2.5, "2", True, None):
+            self.assert_cycle_code(
+                "INVALID_CYCLE_QUERY",
+                self.cycle_query(base, max_hops=bad_value),
+            )
+        # min_usd_value：非负有限数。
+        for bad_value in (-0.01, "0", True, None,
+                          float("inf"), float("nan")):
+            self.assert_cycle_code(
+                "INVALID_CYCLE_QUERY",
+                self.cycle_query(base, min_usd_value=bad_value),
+            )
+        # 边界合法。
+        cycles(self.cycle_query(base, max_hops=2, min_usd_value=0))
+        cycles(self.cycle_query(base, max_hops=8, min_usd_value=0.0))
+
+    def test_error_precedence(self):
+        # threshold -> route -> cycle query -> scoring。
+        bad = self.cycle_query([], threshold=0,
+                               routes=[route("r", 200, "info")],
+                               max_hops=1)
+        self.assert_cycle_code("INVALID_THRESHOLD", bad)
+        bad = self.cycle_query([], routes=[route("r", 200, "info")],
+                               max_hops=1)
+        self.assert_cycle_code("INVALID_ROUTE", bad)
+        bad = self.cycle_query([], max_hops=1)
+        bad["scoring"] = []
+        self.assert_cycle_code("INVALID_CYCLE_QUERY", bad)
+        bad = self.cycle_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_cycle_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.cycle_query(
+            [tx("dup", "A", "B"), tx("dup", "B", "A", ts="bad")])
+        self.assert_cycle_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.cycle_query([tx("t1", "A", "B", amount=0)])
+        self.assert_cycle_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class CycleScoringTests(unittest.TestCase):
+    def cycle_with_scoring(self, scoring, **kwargs):
+        # 两段 amount 不同，避免 ROUND_TRIP 加分干扰逐段 VALUE 求和。
+        transfers = kwargs.pop("transfers", [
+            tx("a", "A", "B", amount=1.0, usd=10000),
+            tx("b", "B", "A", amount=2.0, usd=5000,
+               ts="2026-10-04T11:00:00Z"),
+        ])
+        max_hops = kwargs.pop("max_hops", 4)
+        min_usd_value = kwargs.pop("min_usd_value", 0)
+        body = {
+            "transfers": transfers,
+            "whale_threshold_usd": 10000,
+            "routes": kwargs.pop("routes", []),
+            "cycle_query": {"max_hops": max_hops,
+                            "min_usd_value": min_usd_value},
+        }
+        body.update(kwargs)
+        body["scoring"] = scoring
+        return cycles(body)
+
+    def test_scoring_changes_segment_sum(self):
+        data = self.cycle_with_scoring(
+            {"value_points_per_ratio": 10, "value_points_cap": 100}
+        )
+        cycle = data["cycles"][0]
+        # a=10、b=5，合计 15。
+        self.assertEqual(cycle["score"], 15)
+        self.assertEqual(cycle["reason"], ["VALUE"])
+
+    def test_sum_caps_at_100(self):
+        data = self.cycle_with_scoring(
+            {"value_points_per_ratio": 1000, "value_points_cap": 100},
+            transfers=[
+                tx("a", "A", "B", usd=10000),
+                tx("b", "B", "A", usd=10000,
+                   ts="2026-10-04T11:00:00Z"),
+            ],
+        )
+        self.assertEqual(data["cycles"][0]["score"], 100)
+
+    def test_invalid_scoring_after_cycle_query(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.cycle_with_scoring([])
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_cycle_query_error_precedes_scoring(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.cycle_with_scoring([], max_hops=0)
+        self.assertEqual(ctx.exception.code, "INVALID_CYCLE_QUERY")
+
+
+class CycleCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "cycles"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = {
+            "transfers": [
+                tx("a", "A", "B", usd=1),
+                tx("b", "B", "A", usd=1, ts="2026-10-04T11:00:00Z"),
+            ],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "cycle_query": {"max_hops": 3, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"cycles", "alerts"})
+        self.assertEqual(out["data"]["cycles"][0]["cycle_id"], "a>b")
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_cycles_and_alerts(self):
+        body = {
+            "transfers": [],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "cycle_query": {"max_hops": 3, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"cycles": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "cycle_query": {"max_hops": 1, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_CYCLE_QUERY"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "cycle_query": {"max_hops": 3, "min_usd_value": 0},
+            "scoring": {"window_seconds": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+    def test_non_ascii_round_trip(self):
+        body = {
+            "transfers": [
+                tx("转甲", "地址甲", "地址乙", usd=1),
+                tx("转乙", "地址乙", "地址甲", usd=1,
+                   ts="2026-10-04T11:00:00Z"),
+            ],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "cycle_query": {"max_hops": 3, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body, ensure_ascii=False))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(
+            out["data"]["cycles"][0]["cycle_id"], "转乙>转甲"
         )
 
 
