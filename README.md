@@ -9,7 +9,9 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、watch、converge 六个子命令的
-分析实现，以及仓库根目录的产品入口与 `python -m whale_radar` 模块入口。
+分析实现；在此之上新增 cycles 子命令，发现同链同资产转账的多跳回流
+回路。各命令均提供仓库根目录的产品入口与 `python -m whale_radar` 模块
+入口。
 
 ## 约定
 
@@ -35,7 +37,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-六个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+各子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -84,14 +86,33 @@ stdout 为空，退出码 2。
   顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
   > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
   > INVALID_CONVERGENCE_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar cycles`：同链同资产转账的多跳回流回路（cycles）与按
+  route/cycle 聚合的告警（alerts）。输入沿用 analyze 的 transfers、
+  whale_threshold_usd、routes 与可选 scoring，外加 `cycle_query` 对象：
+  `max_hops`（2..8 整数）与 `min_usd_value`（非负有限数），二者缺一不可、
+  不接受未知字段与布尔值。回路为同链同资产上 2..max_hops 跳的地址简单
+  回路（仅末节点重复起点），不同边序列（含同一回路的反向边序列）均保留；
+  nodes 从字典序最小的参与地址起并回到它，每项含 transfer_ids、cycle_id
+  （transfer_ids 以 `>` 连接）及 hops、chain、asset、amount、usd_value、
+  score、reason；金额与分值保留 10 位小数，过滤 usd_value 小于
+  min_usd_value 的回路。score 为 analyze 逐段分值求和后截到 0..100，
+  reason 按 VALUE、BURST、FAN_OUT、ROUND_TRIP 顺序去重；cycles 按 score
+  降序，再按 chain、asset、cycle_id 升序排序，空时保留空数组。alerts
+  每个 route/cycle 至多一项，score≥route.min_score 且 chains、assets
+  命中星号规则时生成，每项含 route_id、cycle_id、chain、asset、severity、
+  score、reason、target，按 route_id、cycle_id 排序。cycles 的错误码
+  顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
+  > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
+  > INVALID_CYCLE_QUERY > INVALID_SCORING_CONFIG。
 
 ## scoring 配置
 
-`analyze`、`trace-risk`、`rank`、`watch` 接受可选的顶层 `scoring` 对象，
-逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring` 或仅提供部分字段时，
-缺失项沿用下列基线值，输出与基线完全一致。`converge` 校验 `scoring`
-（非法时报 INVALID_SCORING_CONFIG）但不将其用于归集打分；`trace` 不做
-打分，`scoring`（即使字段未知或非法）对其完全忽略。
+`analyze`、`trace-risk`、`rank`、`watch`、`cycles` 接受可选的顶层
+`scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
+或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
+`converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
+用于归集打分；`trace` 不做打分，`scoring`（即使字段未知或非法）对其
+完全忽略。
 
 | 字段 | 基线 | 类型与范围 |
 | --- | --- | --- |
@@ -120,9 +141,10 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 告警去重与稳定排序均不随配置改变。
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
-analyze、trace-risk、rank、watch、converge 五个命令均向 stderr 输出
-`{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，退出码 2，
-且不落任何部分报告。该错误在既有校验全部通过之后才触发：analyze 与
+analyze、trace-risk、rank、watch、cycles、converge 六个命令均向 stderr
+输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，退出码
+2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：analyze 与
 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于 INVALID_TRACE_QUERY，
-watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
-INVALID_CONVERGENCE_QUERY；`trace` 永不产生此错误。
+watch 中晚于 INVALID_WATCH_QUERY，cycles 中晚于
+INVALID_CYCLE_QUERY，converge 中晚于 INVALID_CONVERGENCE_QUERY；
+`trace` 永不产生此错误。
