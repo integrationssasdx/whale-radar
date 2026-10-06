@@ -1,6 +1,6 @@
 """命令行入口：``whale-radar analyze`` / ``trace`` / ``trace-risk`` / ``rank``
-/ ``watch`` / ``converge`` / ``cycles`` / ``layering`` / ``cluster`` 从 stdin
-读 JSON、向 stdout 写 JSON。
+/ ``watch`` / ``converge`` / ``cycles`` / ``layering`` / ``cluster`` /
+``entity`` 从 stdin 读 JSON、向 stdout 写 JSON。
 
 输入错误不落任何部分报告：向 stderr 输出 ``{"error": 错误码}`` 并以退出码 2
 结束；成功时退出码 0。全程不联网、不落盘。
@@ -19,6 +19,7 @@ from .analyzer import AnalyzeError, analyze
 from .cluster import cluster
 from .converge import converge
 from .cycles import cycles
+from .entity import entity
 from .layering import layering
 from .ranker import rank
 from .risk import trace_risk
@@ -35,6 +36,7 @@ _COMMANDS = {
     "cycles": cycles,
     "layering": layering,
     "cluster": cluster,
+    "entity": entity,
 }
 
 VERSION_LINE = "whale-radar %s" % __version__

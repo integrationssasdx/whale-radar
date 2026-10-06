@@ -9,7 +9,7 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、watch、converge、cycles、
-layering、cluster 九个子命令的分析实现，以及仓库根目录的产品入口与
+layering、cluster、entity 十个子命令的分析实现，以及仓库根目录的产品入口与
 `python -m whale_radar` 模块入口。
 
 ## 约定
@@ -36,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-九个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+十个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -161,12 +161,34 @@ stdout 为空，退出码 2。
   > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
   > INVALID_ROUTE > INVALID_CLUSTER_QUERY。cluster 不接受也不需要
   scoring，且不产生 INVALID_SCORING_CONFIG。
+- `whale-radar entity`：把显式地址归并为实体后的高风险实体画像
+  （profiles）与按 route/实体聚合的告警（alerts）。输入沿用 analyze 的
+  transfers、whale_threshold_usd、routes 与可选 scoring，外加必填的
+  `entities` 归并表：非空列表，每项恰含 `id`（非空字符串、全局唯一）与
+  `addresses`（非空列表，元素为互异非空字符串）；地址不跨实体重复，且
+  必须恰好覆盖全部转账的 from/to 地址。缺项、未知字段或非法关系均报
+  INVALID_ENTITY_QUERY。每笔转账按两端地址映射实体：同实体双边各累计一次
+  收发金额、巨鲸次数与发送时间，不产生 counterparty；跨实体双方分别累计
+  发送或接收，巨鲸转账双方各计一次巨鲸。profiles 字段沿用 rank，address
+  改为 `entity_id` 并增列 `addresses`（升序），counterparties 为互异实体
+  id 的升序数组，金额与分值保留 10 位小数；原因沿用 rank 的
+  WHALE_EXPOSURE、COUNTERPARTY_DISTRIBUTION、ROUND_TRIP_ACTIVITY、
+  BURST_ACTIVITY，往返限不同实体间同资产同 amount 的正反向转账，突发按
+  发送时间闭窗口与 burst_count 判定，risk_score 限制在 0..100；profiles
+  按 risk_score 降序、entity_id 升序排序。alerts 每个 route 与 entity 至多
+  一项，实体涉及转账的 chain、asset 命中星号规则且 risk_score 不低于
+  route.min_score 时生成，每项含 route_id、entity_id、severity、score、
+  reason、target，reason 取实体 reasons，按 route_id、entity_id 升序排序，
+  无结果为空数组。entity 的错误码顺序为 INPUT_NOT_JSON
+  > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE
+  > INVALID_THRESHOLD > INVALID_ROUTE > INVALID_ENTITY_QUERY
+  > INVALID_SCORING_CONFIG。
 
 ## scoring 配置
 
-`analyze`、`trace-risk`、`rank`、`watch`、`cycles`、`layering` 接受可选的
-顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
-或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
+`analyze`、`trace-risk`、`rank`、`watch`、`cycles`、`layering`、`entity`
+接受可选的顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略
+`scoring` 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
 `converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
 用于归集打分；`trace` 不做打分，`scoring`（即使字段未知或非法）对其
 完全忽略。
@@ -198,10 +220,11 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 告警去重与稳定排序均不随配置改变。
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
-analyze、trace-risk、rank、watch、converge、cycles、layering 七个命令均向
-stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
-退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：
-analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
+analyze、trace-risk、rank、watch、converge、cycles、layering、entity
+八个命令均向 stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，
+stdout 为空，退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后
+才触发：analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
 INVALID_TRACE_QUERY，watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
 INVALID_CONVERGENCE_QUERY，cycles 中晚于 INVALID_CYCLE_QUERY，layering
-中晚于 INVALID_LAYERING_QUERY；`trace` 永不产生此错误。
+中晚于 INVALID_LAYERING_QUERY，entity 中晚于 INVALID_ENTITY_QUERY；
+`trace` 永不产生此错误。
