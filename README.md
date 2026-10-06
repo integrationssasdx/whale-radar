@@ -9,7 +9,7 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、watch、converge、cycles、
-layering 八个子命令的分析实现，以及仓库根目录的产品入口与
+layering、cluster 九个子命令的分析实现，以及仓库根目录的产品入口与
 `python -m whale_radar` 模块入口。
 
 ## 约定
@@ -36,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-八个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+九个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -140,6 +140,27 @@ stdout 为空，退出码 2。
   > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
   > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
   > INVALID_LAYERING_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar cluster`：窗口内同链同资产的巨鲸资金网络（clusters）与按
+  route/cluster 聚合的告警（alerts）。输入沿用 analyze 的 transfers、
+  whale_threshold_usd、routes，外加恰含 `window_start`、`window_end`
+  （均为带时区 RFC3339 字符串且结束晚于开始）、`min_usd_value`（非负
+  有限数）的 `cluster_query` 对象，缺项、未知字段、布尔或类型范围错误均
+  报 INVALID_CLUSTER_QUERY。在 window_start 到 window_end 的闭区间内，
+  转账按 (chain, asset) 分组并排除自转账，以地址为节点、转账为无向边求
+  连通分量，共同地址相连的转账归入同一网络；网络须至少两笔转账、至少两个
+  地址，usd_value 为纳入转账之和且不低于 min_usd_value（等值保留），无
+  结果返回空数组。每项含 cluster_id、chain、asset、transfer_ids、
+  usd_value、score；transfer_ids 按 timestamp、id 排序，cluster_id 由
+  transfer_ids 以 `>` 连接，
+  score=min(100,40*usd_value/whale_threshold_usd+5*len(transfer_ids))，
+  usd_value 与 score 保留 10 位小数。clusters 按 score 降序，再按 chain、
+  asset、cluster_id 升序排序。alerts 每个 route/cluster 至多一项，
+  score≥route.min_score 且 chains、assets 命中星号规则时生成，每项含
+  route_id、cluster_id、severity、score、target，按 route_id、cluster_id
+  排序。cluster 的错误码顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA
+  > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
+  > INVALID_ROUTE > INVALID_CLUSTER_QUERY。cluster 不接受也不需要
+  scoring，且不产生 INVALID_SCORING_CONFIG。
 
 ## scoring 配置
 
