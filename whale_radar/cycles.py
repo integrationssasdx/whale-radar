@@ -52,6 +52,18 @@ MAX_HOPS_MIN, MAX_HOPS_MAX = 2, 8
 REASON_ORDER = ("VALUE", "BURST", "FAN_OUT", "ROUND_TRIP")
 
 
+def _segments(segment_scores):
+    """与 transfer_ids 同序的逐段归因：transfer_id、逐笔 score 与 reason。"""
+    return [
+        {
+            "transfer_id": item["id"],
+            "score": item["score"],
+            "reason": list(item["reason"]),
+        }
+        for item in segment_scores
+    ]
+
+
 def _validate_cycle_query(payload):
     """cycle_query 校验，返回 (max_hops, min_usd_value)。
 
@@ -184,6 +196,7 @@ def _build_cycles(transfers, threshold, config, max_hops, min_usd_value):
                 "usd_value": _round10(cycle["usd_value"]),
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
+                "segments": _segments(segment_scores),
             }
         )
 

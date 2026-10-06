@@ -37,6 +37,18 @@ from .tracer import MAX_HOPS_MAX, MAX_HOPS_MIN
 REASON_ORDER = ("VALUE", "BURST", "FAN_OUT", "ROUND_TRIP")
 
 
+def _segments(segment_scores):
+    """与 transfer_ids 同序的逐段归因：transfer_id、逐笔 score 与 reason。"""
+    return [
+        {
+            "transfer_id": item["id"],
+            "score": item["score"],
+            "reason": list(item["reason"]),
+        }
+        for item in segment_scores
+    ]
+
+
 def _validate_watch_query(payload):
     """watch_addresses/max_hops 校验，返回 (watch_addresses, max_hops)。
 
@@ -155,6 +167,7 @@ def _watch_paths(transfers, threshold, config, watch_addresses, max_hops):
                 "path_id": ">".join(path["transfer_ids"]),
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
+                "segments": _segments(segment_scores),
             }
         )
 

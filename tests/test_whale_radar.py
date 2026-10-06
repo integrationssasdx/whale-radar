@@ -579,7 +579,7 @@ class TraceRiskTests(unittest.TestCase):
         self.assertEqual(
             set(multi),
             {"nodes", "transfer_ids", "hops", "amount", "usd_value",
-             "score", "reason", "path_id"},
+             "score", "reason", "path_id", "segments"},
         )
         self.assertEqual(multi["nodes"], ["A", "B", "D"])
         self.assertEqual(multi["transfer_ids"], ["t1", "t2"])
@@ -589,6 +589,18 @@ class TraceRiskTests(unittest.TestCase):
         self.assertEqual(multi["score"], 50)
         self.assertEqual(multi["reason"], ["VALUE"])
         self.assertEqual(by_id["t3"]["score"], 40)
+        # segments 与 transfer_ids 同序，逐段归因可回溯到每笔转账。
+        self.assertEqual(
+            multi["segments"],
+            [
+                {"transfer_id": "t1", "score": 40, "reason": ["VALUE"]},
+                {"transfer_id": "t2", "score": 10, "reason": ["VALUE"]},
+            ],
+        )
+        self.assertEqual(
+            by_id["t3"]["segments"],
+            [{"transfer_id": "t3", "score": 40, "reason": ["VALUE"]}],
+        )
 
     def test_score_sorted_desc_then_hops_then_transfer_ids(self):
         data = trace_risk(self.risk_query([
@@ -634,6 +646,33 @@ class TraceRiskTests(unittest.TestCase):
         path = next(p for p in data["paths"] if p["path_id"] == "s1>s2")
         # s1 同时有 VALUE 与 ROUND_TRIP；s2 仅 VALUE；合并去重且按固定顺序。
         self.assertEqual(path["reason"], ["VALUE", "ROUND_TRIP"])
+        # 逐段 reason 各自去重并保持同一固定顺序。
+        self.assertEqual(
+            path["segments"],
+            [
+                {"transfer_id": "s1", "score": 55,
+                 "reason": ["VALUE", "ROUND_TRIP"]},
+                {"transfer_id": "s2", "score": 40, "reason": ["VALUE"]},
+            ],
+        )
+
+    def test_segments_follow_scoring_override(self):
+        query = self.risk_query([
+            tx("t1", "A", "B", usd=50000),
+            tx("t2", "B", "D", usd=5000),
+        ])
+        query["scoring"] = {"value_points_per_ratio": 10}
+        data = trace_risk(query)
+        path = data["paths"][0]
+        # 覆盖后 t1 为 50 截到 value_points_cap=40，t2 为 5，汇总 45。
+        self.assertEqual(
+            path["segments"],
+            [
+                {"transfer_id": "t1", "score": 40, "reason": ["VALUE"]},
+                {"transfer_id": "t2", "score": 5, "reason": ["VALUE"]},
+            ],
+        )
+        self.assertEqual(path["score"], 45)
 
     def test_alerts_one_per_route_path_and_sorted(self):
         routes = [
@@ -1398,7 +1437,7 @@ class WatchTests(unittest.TestCase):
             set(direct),
             {"nodes", "transfer_ids", "hops", "amount", "usd_value",
              "from_address", "to_address", "chain", "asset", "path_id",
-             "score", "reason"},
+             "score", "reason", "segments"},
         )
         self.assertEqual(direct["nodes"], ["A", "D"])
         self.assertEqual(direct["hops"], 1)
@@ -1409,6 +1448,10 @@ class WatchTests(unittest.TestCase):
         # 50/10000*20 = 0.1。
         self.assertEqual(direct["score"], 0.1)
         self.assertEqual(direct["reason"], ["VALUE"])
+        self.assertEqual(
+            direct["segments"],
+            [{"transfer_id": "t3", "score": 0.1, "reason": ["VALUE"]}],
+        )
         relay = data["paths"][1]
         self.assertEqual(relay["nodes"], ["A", "B", "D"])
         self.assertEqual(relay["amount"], 3)
@@ -1416,6 +1459,13 @@ class WatchTests(unittest.TestCase):
         # t1=0.02、t2=0.04，合计 0.06。
         self.assertEqual(relay["score"], 0.06)
         self.assertEqual(relay["reason"], ["VALUE"])
+        self.assertEqual(
+            relay["segments"],
+            [
+                {"transfer_id": "t1", "score": 0.02, "reason": ["VALUE"]},
+                {"transfer_id": "t2", "score": 0.04, "reason": ["VALUE"]},
+            ],
+        )
 
     def test_paths_for_every_ordered_pair_of_watch_addresses(self):
         data = watch(self.watch_query([
@@ -2156,7 +2206,8 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(
             set(cycle),
             {"transfer_ids", "cycle_id", "nodes", "hops", "chain",
-             "asset", "amount", "usd_value", "score", "reason"},
+             "asset", "amount", "usd_value", "score", "reason",
+             "segments"},
         )
         self.assertEqual(cycle["transfer_ids"], ["out", "back"])
         self.assertEqual(cycle["cycle_id"], "out>back")
@@ -2169,6 +2220,16 @@ class CycleTests(unittest.TestCase):
         # 每段 40 VALUE + 15 ROUND_TRIP = 55，合计 110 截到 100。
         self.assertEqual(cycle["score"], 100)
         self.assertEqual(cycle["reason"], ["VALUE", "ROUND_TRIP"])
+        # segments 与 transfer_ids 同序，闭合边在最后。
+        self.assertEqual(
+            cycle["segments"],
+            [
+                {"transfer_id": "out", "score": 55,
+                 "reason": ["VALUE", "ROUND_TRIP"]},
+                {"transfer_id": "back", "score": 55,
+                 "reason": ["VALUE", "ROUND_TRIP"]},
+            ],
+        )
 
     def test_triangle_starts_at_lexicographically_smallest_node(self):
         data = cycles(self.cycle_query([

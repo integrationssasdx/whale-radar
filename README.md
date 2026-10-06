@@ -45,6 +45,14 @@ stdout 为空，退出码 2。
   原因的风险路径（paths）及按 route/path 聚合的告警（alerts）。输入为 analyze
   的 transfers、whale_threshold_usd、routes 加 trace 的 chain、asset、
   start_address、end_address、max_hops，成功时 data 仅含 `paths`、`alerts`。
+  每条 path 另含 `segments`：与 transfer_ids 同序对应，每项恰好含
+  transfer_id、score、reason，score 为 analyze 同一 scoring 配置下的
+  逐笔 0..100 分（保留 10 位小数），reason 按 VALUE、BURST、FAN_OUT、
+  ROUND_TRIP 去重。
+  每条 path 另含 `segments`：与 transfer_ids 同序对应，每项恰好含
+  transfer_id、score、reason，score 为 analyze 同一 scoring 配置下的
+  逐笔 0..100 分（保留 10 位小数），reason 按 VALUE、BURST、FAN_OUT、
+  ROUND_TRIP 去重。
 - `whale-radar rank`：高风险巨鲸地址画像（profiles）与按 route/地址
   聚合的告警（alerts）。输入同 analyze（transfers、whale_threshold_usd、
   routes），成功时 data 仅含 `profiles`、`alerts` 两个数组。
@@ -54,9 +62,12 @@ stdout 为空，退出码 2。
   和 1..8 整数 `max_hops`。paths 枚举同链同资产上关注地址之间的有向简单
   路径（地址不重复，跳数 1..max_hops，路径两端均为关注地址），每项含
   nodes、transfer_ids、hops、amount、usd_value、from_address、to_address、
-  chain、asset、path_id、score、reason；金额按 10 位小数汇总，path_id 由
+  chain、asset、path_id、score、reason、segments；金额按 10 位小数汇总，
+  path_id 由
   transfer_ids 以 `>` 连接。score 为 analyze 逐段分值求和后截到 0..100，
-  reason 按 VALUE、BURST、FAN_OUT、ROUND_TRIP 去重；paths 按 score 降序，
+  reason 按 VALUE、BURST、FAN_OUT、ROUND_TRIP 去重；segments 与
+  transfer_ids 同序对应，每项恰好含 transfer_id、score、reason（同
+  trace-risk 的 segments 约定）。paths 按 score 降序，
   再按 hops、chain、asset、transfer_ids 升序。alerts 每个 route/path 至多
   一项，score≥route.min_score 且 chains、assets 命中星号规则时生成，每项含
   route_id、path_id、from_address、to_address、chain、asset、severity、
@@ -92,10 +103,12 @@ stdout 为空，退出码 2。
   重复起点外其余地址互不相同，不同边序列（含反向回路）各自保留，自转账
   不成环。nodes 从字典序最小参与地址起并回到它，每项含 transfer_ids、
   cycle_id（transfer_ids 以 `>` 连接）及 nodes、hops、chain、asset、
-  amount、usd_value、score、reason；金额与 score 保留 10 位小数，
+  amount、usd_value、score、reason、segments；金额与 score 保留 10 位小数，
   usd_value 小于 min_usd_value 的回路被过滤（等值保留）。score 为 analyze
   逐段分值求和后截到 0..100，reason 按 VALUE、BURST、FAN_OUT、ROUND_TRIP
-  去重；cycles 按 score 降序、chain、asset、cycle_id 升序排序，空时保留
+  去重；segments 与 transfer_ids 同序对应（闭合边在最后），每项恰好含
+  transfer_id、score、reason（同 trace-risk 的 segments 约定）。cycles 按
+  score 降序、chain、asset、cycle_id 升序排序，空时保留
   空数组。alerts 每个 route/cycle 至多一项，score≥route.min_score 且
   chains、assets 命中星号规则时生成，字段为 route_id、cycle_id、chain、
   asset、severity、score、reason、target，按 route_id、cycle_id 排序。

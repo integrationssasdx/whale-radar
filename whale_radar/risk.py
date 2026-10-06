@@ -33,6 +33,18 @@ from .tracer import _find_paths, _validate_query
 REASON_ORDER = ("VALUE", "BURST", "FAN_OUT", "ROUND_TRIP")
 
 
+def _segments(segment_scores):
+    """与 transfer_ids 同序的逐段归因：transfer_id、逐笔 score 与 reason。"""
+    return [
+        {
+            "transfer_id": item["id"],
+            "score": item["score"],
+            "reason": list(item["reason"]),
+        }
+        for item in segment_scores
+    ]
+
+
 def _risk_paths(transfers, threshold, config, chain, asset, start, end,
                 max_hops):
     """在 trace 拓扑路径上附加逐段合并的 analyze 分值、原因与 path_id。"""
@@ -62,6 +74,7 @@ def _risk_paths(transfers, threshold, config, chain, asset, start, end,
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
                 "path_id": ">".join(path["transfer_ids"]),
+                "segments": _segments(segment_scores),
             }
         )
 
