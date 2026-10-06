@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whale_radar.analyzer import AnalyzeError, analyze
+from whale_radar.cluster import cluster
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
 from whale_radar.layering import layering
@@ -3085,6 +3086,368 @@ class LayeringCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(
             json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
+        )
+
+
+WINDOW_START = "2026-10-04T00:00:00Z"
+WINDOW_END = "2026-10-05T00:00:00Z"
+
+
+def cluster_body(transfers, threshold=10000.0, routes=None,
+                 window_start=WINDOW_START, window_end=WINDOW_END,
+                 min_usd_value=0, **extra):
+    body = {
+        "transfers": transfers,
+        "whale_threshold_usd": threshold,
+        "routes": routes or [],
+        "cluster_query": {
+            "window_start": window_start,
+            "window_end": window_end,
+            "min_usd_value": min_usd_value,
+        },
+    }
+    body.update(extra)
+    return body
+
+
+class ClusterTests(unittest.TestCase):
+    def assert_cluster_code(self, code, body):
+        with self.assertRaises(AnalyzeError) as ctx:
+            cluster(body)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_connected_via_common_address(self):
+        data = cluster(cluster_body([
+            tx("t2", "B", "C", usd=200, ts="2026-10-04T10:10:00Z"),
+            tx("t1", "A", "B", usd=100),
+            tx("t9", "X", "Y", usd=50),  # 单笔不成网络
+        ]))
+        self.assertEqual(len(data["clusters"]), 1)
+        item = data["clusters"][0]
+        self.assertEqual(item["cluster_id"], "t1>t2")
+        self.assertEqual(item["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(item["chain"], "eth")
+        self.assertEqual(item["asset"], "ETH")
+        self.assertEqual(item["usd_value"], 300)
+        # score = min(100, 40*300/10000 + 5*2) = 11.2
+        self.assertEqual(item["score"], 11.2)
+        self.assertEqual(set(item), {"cluster_id", "chain", "asset",
+                                     "transfer_ids", "usd_value", "score"})
+
+    def test_transitive_chain_and_direction_irrelevant(self):
+        data = cluster(cluster_body([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "C", "B", usd=1, ts="2026-10-04T10:01:00Z"),
+            tx("t3", "D", "C", usd=1, ts="2026-10-04T10:02:00Z"),
+        ]))
+        self.assertEqual(len(data["clusters"]), 1)
+        self.assertEqual(data["clusters"][0]["transfer_ids"],
+                         ["t1", "t2", "t3"])
+
+    def test_window_closed_interval(self):
+        data = cluster(cluster_body(
+            [
+                tx("t1", "A", "B", usd=1, ts=WINDOW_START),
+                tx("t2", "B", "C", usd=1, ts=WINDOW_END),
+                tx("t3", "C", "D", usd=1, ts="2026-10-03T23:59:59Z"),
+                tx("t4", "D", "E", usd=1, ts="2026-10-05T00:00:01Z"),
+            ],
+            window_start=WINDOW_START, window_end=WINDOW_END,
+        ))
+        self.assertEqual(len(data["clusters"]), 1)
+        self.assertEqual(data["clusters"][0]["transfer_ids"], ["t1", "t2"])
+
+    def test_window_with_timezone_offset(self):
+        data = cluster(cluster_body(
+            [
+                tx("t1", "A", "B", usd=1, ts="2026-10-04T10:30:00Z"),
+                tx("t2", "B", "C", usd=1, ts="2026-10-04T10:40:00Z"),
+            ],
+            window_start="2026-10-04T12:00:00+02:00",
+            window_end="2026-10-04T13:00:00+02:00",
+        ))
+        self.assertEqual(len(data["clusters"]), 1)
+
+    def test_self_transfer_excluded(self):
+        data = cluster(cluster_body([
+            tx("t1", "A", "A", usd=100),
+            tx("t2", "A", "B", usd=1),
+            tx("t3", "B", "C", usd=1, ts="2026-10-04T10:01:00Z"),
+        ]))
+        self.assertEqual(len(data["clusters"]), 1)
+        self.assertEqual(data["clusters"][0]["transfer_ids"], ["t2", "t3"])
+        self.assertEqual(data["clusters"][0]["usd_value"], 2)
+
+    def test_groups_split_by_chain_and_asset(self):
+        data = cluster(cluster_body([
+            tx("t1", "A", "B", usd=1, chain="eth", asset="ETH"),
+            tx("t2", "B", "C", usd=1, chain="bsc", asset="ETH",
+               ts="2026-10-04T10:01:00Z"),
+            tx("t3", "C", "D", usd=1, chain="eth", asset="USDT",
+               ts="2026-10-04T10:02:00Z"),
+            tx("t4", "B", "C", usd=1, chain="eth", asset="ETH",
+               ts="2026-10-04T10:03:00Z"),
+        ]))
+        # 仅 eth/ETH 组内 t1、t4 经 B 相连成网；其余组各不足两笔。
+        self.assertEqual(len(data["clusters"]), 1)
+        self.assertEqual(data["clusters"][0]["transfer_ids"], ["t1", "t4"])
+
+    def test_min_usd_value_inclusive(self):
+        transfers = [tx("t1", "A", "B", usd=60),
+                     tx("t2", "B", "C", usd=40, ts="2026-10-04T10:01:00Z")]
+        data = cluster(cluster_body(transfers, min_usd_value=100))
+        self.assertEqual(len(data["clusters"]), 1)
+        data = cluster(cluster_body(transfers, min_usd_value=100.01))
+        self.assertEqual(data["clusters"], [])
+
+    def test_single_transfer_network_excluded(self):
+        data = cluster(cluster_body([tx("t1", "A", "B", usd=99999)]))
+        self.assertEqual(data["clusters"], [])
+        self.assertEqual(data["alerts"], [])
+
+    def test_score_formula_and_cap(self):
+        data = cluster(cluster_body(
+            [tx("t1", "A", "B", usd=10000),
+             tx("t2", "B", "C", usd=0, ts="2026-10-04T10:01:00Z")],
+            threshold=10000,
+        ))
+        # 40*10000/10000 + 5*2 = 50
+        self.assertEqual(data["clusters"][0]["score"], 50)
+        data = cluster(cluster_body(
+            [tx("t1", "A", "B", usd=1000000),
+             tx("t2", "B", "C", usd=1000000, ts="2026-10-04T10:01:00Z")],
+            threshold=10000,
+        ))
+        self.assertEqual(data["clusters"][0]["score"], 100)
+
+    def test_transfer_ids_sorted_by_timestamp_then_id(self):
+        data = cluster(cluster_body([
+            tx("t2", "B", "C", usd=1, ts="2026-10-04T10:00:00Z"),
+            tx("t1", "A", "B", usd=1, ts="2026-10-04T10:00:00Z"),
+            tx("t0", "C", "D", usd=1, ts="2026-10-04T09:00:00Z"),
+        ]))
+        self.assertEqual(data["clusters"][0]["transfer_ids"],
+                         ["t0", "t1", "t2"])
+        self.assertEqual(data["clusters"][0]["cluster_id"], "t0>t1>t2")
+
+    def test_clusters_sorted_score_desc_then_chain_asset_id(self):
+        data = cluster(cluster_body([
+            # eth/ETH 高分网络
+            tx("h1", "A", "B", usd=10000),
+            tx("h2", "B", "C", usd=10000, ts="2026-10-04T10:01:00Z"),
+            # bsc/ETH 与 eth/USDT 同分网络
+            tx("e1", "D", "E", usd=100, chain="eth", asset="USDT",
+               ts="2026-10-04T10:02:00Z"),
+            tx("e2", "E", "F", usd=100, chain="eth", asset="USDT",
+               ts="2026-10-04T10:03:00Z"),
+            tx("b1", "G", "H", usd=100, chain="bsc", asset="ETH",
+               ts="2026-10-04T10:04:00Z"),
+            tx("b2", "H", "I", usd=100, chain="bsc", asset="ETH",
+               ts="2026-10-04T10:05:00Z"),
+        ]))
+        keys = [(c["chain"], c["asset"], c["cluster_id"])
+                for c in data["clusters"]]
+        self.assertEqual(keys, [
+            ("eth", "ETH", "h1>h2"),
+            ("bsc", "ETH", "b1>b2"),
+            ("eth", "USDT", "e1>e2"),
+        ])
+
+    def test_empty_result_keeps_arrays(self):
+        data = cluster(cluster_body([]))
+        self.assertEqual(data, {"clusters": [], "alerts": []})
+
+    def test_data_only_clusters_and_alerts(self):
+        data = cluster(cluster_body([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "B", "C", usd=1, ts="2026-10-04T10:01:00Z"),
+        ]))
+        self.assertEqual(set(data), {"clusters", "alerts"})
+
+    def test_scoring_ignored(self):
+        body = cluster_body(
+            [tx("t1", "A", "B", usd=1),
+             tx("t2", "B", "C", usd=1, ts="2026-10-04T10:01:00Z")],
+            scoring={"window_seconds": 0, "unknown": 1},
+        )
+        data = cluster(body)
+        self.assertEqual(len(data["clusters"]), 1)
+
+
+class ClusterAlertTests(unittest.TestCase):
+    def setUp(self):
+        self.transfers = [
+            tx("t1", "A", "B", usd=10000),
+            tx("t2", "B", "C", usd=0, ts="2026-10-04T10:01:00Z"),
+        ]
+        # score = 40*10000/10000 + 5*2 = 50
+
+    def test_alert_fields_and_dedup_per_route_cluster(self):
+        data = cluster(cluster_body(self.transfers, routes=[
+            route("r1", 50, "critical", target="desk"),
+            route("r2", 10, "info"),
+        ]))
+        self.assertEqual(len(data["alerts"]), 2)
+        alert = data["alerts"][0]
+        self.assertEqual(alert, {
+            "route_id": "r1",
+            "cluster_id": "t1>t2",
+            "severity": "critical",
+            "score": 50,
+            "target": "desk",
+        })
+        self.assertEqual(data["alerts"][1]["route_id"], "r2")
+
+    def test_alert_min_score_boundary_inclusive(self):
+        for min_score, expected in ((50, 1), (50.01, 0)):
+            data = cluster(cluster_body(
+                self.transfers, routes=[route("r", min_score, "info")]))
+            self.assertEqual(len(data["alerts"]), expected)
+
+    def test_alert_chain_asset_star_and_mismatch(self):
+        data = cluster(cluster_body(self.transfers, routes=[
+            route("r1", 0, "info", chains=("eth",), assets=("ETH",)),
+            route("r2", 0, "info", chains=("bsc",)),
+            route("r3", 0, "info", assets=("BTC",)),
+        ]))
+        self.assertEqual([a["route_id"] for a in data["alerts"]], ["r1"])
+
+    def test_alerts_sorted_by_route_then_cluster(self):
+        transfers = self.transfers + [
+            tx("u1", "D", "E", usd=10000, chain="bsc",
+               ts="2026-10-04T10:02:00Z"),
+            tx("u2", "E", "F", usd=0, chain="bsc",
+               ts="2026-10-04T10:03:00Z"),
+        ]
+        data = cluster(cluster_body(transfers, routes=[
+            route("r2", 0, "info"), route("r1", 0, "info")]))
+        self.assertEqual(
+            [(a["route_id"], a["cluster_id"]) for a in data["alerts"]],
+            [("r1", "t1>t2"), ("r1", "u1>u2"),
+             ("r2", "t1>t2"), ("r2", "u1>u2")],
+        )
+
+
+class ClusterQueryErrorTests(unittest.TestCase):
+    def assert_cluster_code(self, code, body):
+        with self.assertRaises(AnalyzeError) as ctx:
+            cluster(body)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_missing_and_unknown_fields(self):
+        base = [tx("t1", "A", "B")]
+        self.assert_cluster_code("INVALID_CLUSTER_QUERY",
+                                 payload(base))  # 整体缺失
+        for field in ("window_start", "window_end", "min_usd_value"):
+            bad = cluster_body(base)
+            del bad["cluster_query"][field]
+            self.assert_cluster_code("INVALID_CLUSTER_QUERY", bad)
+        bad = cluster_body(base)
+        bad["cluster_query"]["unknown"] = 1
+        self.assert_cluster_code("INVALID_CLUSTER_QUERY", bad)
+        for raw in ([], "x", 1, None, True):
+            bad = cluster_body(base)
+            bad["cluster_query"] = raw
+            self.assert_cluster_code("INVALID_CLUSTER_QUERY", bad)
+
+    def test_window_bounds_invalid(self):
+        base = [tx("t1", "A", "B")]
+        for field in ("window_start", "window_end"):
+            for bad_value in ("2026-10-04T00:00:00",  # 缺时区
+                              "not-a-time", "", 1, 1.5, True, None, []):
+                self.assert_cluster_code(
+                    "INVALID_CLUSTER_QUERY",
+                    cluster_body(base, **{field: bad_value}),
+                )
+        # 结束必须严格晚于开始。
+        self.assert_cluster_code(
+            "INVALID_CLUSTER_QUERY",
+            cluster_body(base, window_end=WINDOW_START),
+        )
+        self.assert_cluster_code(
+            "INVALID_CLUSTER_QUERY",
+            cluster_body(base, window_start=WINDOW_END,
+                         window_end=WINDOW_START),
+        )
+
+    def test_min_usd_value_invalid(self):
+        base = [tx("t1", "A", "B")]
+        for bad_value in (-0.01, "0", True, None,
+                          float("inf"), float("nan")):
+            self.assert_cluster_code(
+                "INVALID_CLUSTER_QUERY",
+                cluster_body(base, min_usd_value=bad_value),
+            )
+        # 边界合法。
+        cluster(cluster_body(base, min_usd_value=0))
+        cluster(cluster_body(base, min_usd_value=0.0))
+
+    def test_error_precedence(self):
+        # threshold -> route -> cluster query。
+        bad = cluster_body([], threshold=0,
+                           routes=[route("r", 200, "info")],
+                           min_usd_value=-1)
+        self.assert_cluster_code("INVALID_THRESHOLD", bad)
+        bad = cluster_body([], routes=[route("r", 200, "info")],
+                           min_usd_value=-1)
+        self.assert_cluster_code("INVALID_ROUTE", bad)
+        bad = cluster_body([], min_usd_value=-1)
+        bad["scoring"] = {"window_seconds": 0}  # scoring 被忽略
+        self.assert_cluster_code("INVALID_CLUSTER_QUERY", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = cluster_body(
+            [tx("dup", "A", "B"), tx("dup", "C", "D", ts="bad")])
+        self.assert_cluster_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = cluster_body([tx("t1", "A", "B", amount=0)])
+        self.assert_cluster_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class ClusterCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "cluster"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = cluster_body([
+            tx("t1", "A", "B", usd=1),
+            tx("t2", "B", "C", usd=1, ts="2026-10-04T10:01:00Z"),
+        ])
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"clusters", "alerts"})
+        self.assertEqual(out["data"]["clusters"][0]["cluster_id"], "t1>t2")
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_clusters_and_alerts(self):
+        proc = self.run_cli(json.dumps(cluster_body([])))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"clusters": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = cluster_body([], window_end=WINDOW_START)
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_CLUSTER_QUERY"}
         )
 
 

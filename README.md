@@ -9,7 +9,7 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、watch、converge、cycles、
-layering 八个子命令的分析实现，以及仓库根目录的产品入口与
+layering、cluster 九个子命令的分析实现，以及仓库根目录的产品入口与
 `python -m whale_radar` 模块入口。
 
 ## 约定
@@ -36,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-八个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+九个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -140,6 +140,26 @@ stdout 为空，退出码 2。
   > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
   > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
   > INVALID_LAYERING_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar cluster`：时间窗内共同地址相连的转账网络（clusters）与按
+  route/cluster 聚合的告警（alerts）。输入沿用 analyze 的 transfers、
+  whale_threshold_usd、routes，外加 `cluster_query` 对象：`window_start`
+  与 `window_end`（带时区的 RFC3339 字符串且结束晚于开始）与
+  `min_usd_value`（非负有限数），三者缺一不可、不接受未知字段与布尔值。
+  转账先按 [window_start, window_end] 闭区间过滤，再按 (chain, asset)
+  分组并排除自转账；组内由共同地址相连的转账归入同一网络。网络须至少
+  两笔、至少两个地址，usd_value 为纳入转账之和且不低于 min_usd_value，
+  无结果时 clusters 为空数组。每项含 cluster_id、chain、asset、
+  transfer_ids、usd_value、score；transfer_ids 按 timestamp、id 排序
+  并以 `>` 连接为 cluster_id，usd_value 与 score 保留 10 位小数。
+  score=min(100, 40*usd_value/whale_threshold_usd+5*len(transfer_ids))。
+  clusters 按 score 降序，再按 chain、asset、cluster_id 升序。alerts
+  每个 route/cluster 至多一项，score>=route.min_score 且 chains、assets
+  命中星号规则时生成，每项含 route_id、cluster_id、severity、score、
+  target，按 route_id、cluster_id 排序。cluster 不做打分配置，
+  `scoring`（即使字段未知或非法）对其完全忽略。cluster 的错误码顺序为
+  INPUT_NOT_JSON > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
+  > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
+  > INVALID_CLUSTER_QUERY。
 
 ## scoring 配置
 
@@ -147,8 +167,8 @@ stdout 为空，退出码 2。
 顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
 `converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
-用于归集打分；`trace` 不做打分，`scoring`（即使字段未知或非法）对其
-完全忽略。
+用于归集打分；`trace` 与 `cluster` 不做打分，`scoring`（即使字段未知
+或非法）对其完全忽略。
 
 | 字段 | 基线 | 类型与范围 |
 | --- | --- | --- |
@@ -183,4 +203,4 @@ stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
 analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
 INVALID_TRACE_QUERY，watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
 INVALID_CONVERGENCE_QUERY，cycles 中晚于 INVALID_CYCLE_QUERY，layering
-中晚于 INVALID_LAYERING_QUERY；`trace` 永不产生此错误。
+中晚于 INVALID_LAYERING_QUERY；`trace` 与 `cluster` 永不产生此错误。
