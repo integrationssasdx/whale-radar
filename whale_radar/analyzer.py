@@ -416,6 +416,18 @@ def _score_transfers(transfers, threshold, config):
     return scores
 
 
+def _segments(segment_scores):
+    """逐段风险归因：与 transfer_ids 同序，每项恰含 transfer_id/score/reason。"""
+    return [
+        {
+            "transfer_id": item["id"],
+            "score": item["score"],
+            "reason": list(item["reason"]),
+        }
+        for item in segment_scores
+    ]
+
+
 def _match(patterns, raw_value):
     return "*" in patterns or raw_value in patterns
 

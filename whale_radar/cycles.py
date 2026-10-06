@@ -15,7 +15,11 @@ cycle_id 由 transfer_ids 以 ``>`` 连接。每项含 transfer_ids、cycle_id �
 nodes、hops、chain、asset、amount、usd_value、score、reason；金额与
 score 保留 10 位小数，usd_value 小于 min_usd_value 的回路被过滤。score
 为 analyze 逐段分值求和后截到 0..100，reason 按 VALUE、BURST、FAN_OUT、
-ROUND_TRIP 顺序去重；cycles 按 score 降序、chain、asset、cycle_id 升序
+ROUND_TRIP 顺序去重；每条回路另附 segments：与 transfer_ids 同序对应
+（闭合边在最后），每项恰含 transfer_id、score（analyze 同一 scoring
+配置下的逐笔 0..100 分，保留 10 位小数）、reason（按 VALUE、BURST、
+FAN_OUT、ROUND_TRIP 去重）。cycles 按 score 降序、chain、asset、cycle_id
+升序
 排序。alerts 每个 route/cycle 至多一项，score>=route.min_score 且 chains、
 assets 命中星号规则时生成，字段为 route_id、cycle_id、chain、asset、
 severity、score、reason、target，按 route_id、cycle_id 排序。
@@ -37,6 +41,7 @@ from .analyzer import (
     _match,
     _round10,
     _score_transfers,
+    _segments,
     _validate_duplicates,
     _validate_routes,
     _validate_schema,
@@ -184,6 +189,7 @@ def _build_cycles(transfers, threshold, config, max_hops, min_usd_value):
                 "usd_value": _round10(cycle["usd_value"]),
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
+                "segments": _segments(segment_scores),
             }
         )
 

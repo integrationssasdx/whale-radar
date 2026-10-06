@@ -6,7 +6,10 @@ max_hops），输出 data 仅含 paths、alerts 两个数组。
 
 路径搜索沿用 tracer 的同链同资产简单路径；逐段分值与原因沿用 analyze 的
 逐笔打分，路径分值为各段之和（上限 100），原因按
-VALUE BURST FAN_OUT ROUND_TRIP 顺序去重。
+VALUE BURST FAN_OUT ROUND_TRIP 顺序去重。每条路径另附 segments：
+与 transfer_ids 同序对应，每项恰含 transfer_id、score（analyze 同一
+scoring 配置下的逐笔 0..100 分，保留 10 位小数）、reason（按
+VALUE BURST FAN_OUT ROUND_TRIP 去重）。
 
 校验复用 analyzer 与 tracer，错误码与优先级为：
 
@@ -21,6 +24,7 @@ from .analyzer import (
     _match,
     _round10,
     _score_transfers,
+    _segments,
     _validate_duplicates,
     _validate_routes,
     _validate_schema,
@@ -62,6 +66,7 @@ def _risk_paths(transfers, threshold, config, chain, asset, start, end,
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
                 "path_id": ">".join(path["transfer_ids"]),
+                "segments": _segments(segment_scores),
             }
         )
 

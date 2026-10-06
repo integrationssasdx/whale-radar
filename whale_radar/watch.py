@@ -7,7 +7,10 @@ paths、alerts 两个数组；无路径时两者均为空数组。
 paths 在每个 (chain, asset) 组内枚举关注地址之间的有向简单路径（地址不
 重复，1..max_hops 跳，起止均为关注地址，中途可经过其他关注地址）；逐段
 分值与原因沿用 analyze 的逐笔打分，路径分值为各段之和后截到 0..100，原因
-按 VALUE BURST FAN_OUT ROUND_TRIP 顺序去重。paths 按 score 降序，再按
+按 VALUE BURST FAN_OUT ROUND_TRIP 顺序去重。每条路径另附 segments：
+与 transfer_ids 同序对应，每项恰含 transfer_id、score（analyze 同一
+scoring 配置下的逐笔 0..100 分，保留 10 位小数）、reason（按
+VALUE BURST FAN_OUT ROUND_TRIP 去重）。paths 按 score 降序，再按
 hops、chain、asset、transfer_ids 升序排序。alerts 每个 route/path 至多
 一项，需 score>=route.min_score 且 chains、assets 命中星号规则。
 
@@ -25,6 +28,7 @@ from .analyzer import (
     _match,
     _round10,
     _score_transfers,
+    _segments,
     _validate_duplicates,
     _validate_routes,
     _validate_schema,
@@ -155,6 +159,7 @@ def _watch_paths(transfers, threshold, config, watch_addresses, max_hops):
                 "path_id": ">".join(path["transfer_ids"]),
                 "score": _round10(min(100.0, total)),
                 "reason": reasons,
+                "segments": _segments(segment_scores),
             }
         )
 
