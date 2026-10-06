@@ -9,7 +9,7 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、entity、watch、converge、cycles、
-layering、cluster 十个子命令的分析实现，以及仓库根目录的产品入口与
+layering、cluster、handoff 十一个子命令的分析实现，以及仓库根目录的产品入口与
 `python -m whale_radar` 模块入口。
 
 ## 约定
@@ -183,11 +183,37 @@ stdout 为空，退出码 2。
   > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
   > INVALID_ROUTE > INVALID_CLUSTER_QUERY。cluster 不接受也不需要
   scoring，且不产生 INVALID_SCORING_CONFIG。
+- `whale-radar handoff`：跨链交接追踪（handoffs）与按 route/event 聚合的
+  告警（alerts）。输入沿用 analyze 的 transfers、whale_threshold_usd、
+  routes 与可选 scoring，外加恰含 `window_seconds`（1..86400 整数）与
+  `min_usd_value`（非负有限数）的 `handoff_query` 对象，缺项、未知字段、
+  布尔或类型范围错误均报 INVALID_HANDOFF_QUERY。handoff 为一对有序转账
+  （首 -> 次）构成的跨链交接：两笔 id 不同且均非自转账，asset 相同，首笔
+  to_address 等于次笔 from_address（交接地址 intermediary），chain 不同，
+  次笔时间减首笔时间落在 [0, window_seconds] 闭区间，且事件 usd_value
+  （两笔美元价值的较大者）不低于 min_usd_value；时间相同的两笔按两种
+  顺序各自成事件。每项含 event_id（transfer_ids 以 `>` 连接）、
+  transfer_ids（首、次顺序）、intermediary、source_/destination_ 前缀的
+  address、chain、amount、usd_value（首/次笔的发送侧与接收侧）、
+  amount_delta 与 usd_delta（次减首）、usd_value（两笔较大者），派生
+  金额保留 10 位小数。score 为 analyze 逐段分值之和加 15，美元价值下降
+  （次笔小于首笔）再加 10，截到 0..100；reason 以 CROSS_CHAIN_HANDOFF
+  起，按 VALUE、BURST、FAN_OUT、ROUND_TRIP 顺序去重合并两段原因，下降
+  时追加 VALUE_DROP。每项另附 segments：与 transfer_ids 同序对应，每项
+  恰含 transfer_id、score（analyze 同一 scoring 配置下的逐笔 0..100 分，
+  保留 10 位小数）、reason（按 VALUE、BURST、FAN_OUT、ROUND_TRIP 去重）。
+  handoffs 按 score 降序、event_id 升序排序，空时保留空数组。alerts 每个
+  route/event 至多一项，score≥route.min_score 且 chains 同时命中两端链、
+  assets 命中资产（星号规则）时生成，每项含 route_id、event_id、
+  intermediary、severity、score、reason、target，按 route_id、event_id
+  排序。handoff 的错误码顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA
+  > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
+  > INVALID_ROUTE > INVALID_HANDOFF_QUERY > INVALID_SCORING_CONFIG。
 
 ## scoring 配置
 
-`analyze`、`trace-risk`、`rank`、`entity`、`watch`、`cycles`、`layering`
-接受可选的
+`analyze`、`trace-risk`、`rank`、`entity`、`watch`、`cycles`、`layering`、
+`handoff` 接受可选的
 顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
 `converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
@@ -221,12 +247,13 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 告警去重与稳定排序均不随配置改变。
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
-analyze、trace-risk、rank、entity、watch、converge、cycles、layering
-八个命令均向
+analyze、trace-risk、rank、entity、watch、converge、cycles、layering、
+handoff 九个命令均向
 stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
 退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：
 analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
 INVALID_TRACE_QUERY，entity 中晚于 INVALID_ENTITY_QUERY，watch 中晚于
 INVALID_WATCH_QUERY，converge 中晚于 INVALID_CONVERGENCE_QUERY，cycles
-中晚于 INVALID_CYCLE_QUERY，layering 中晚于 INVALID_LAYERING_QUERY；
+中晚于 INVALID_CYCLE_QUERY，layering 中晚于 INVALID_LAYERING_QUERY，
+handoff 中晚于 INVALID_HANDOFF_QUERY；
 `trace` 永不产生此错误。
