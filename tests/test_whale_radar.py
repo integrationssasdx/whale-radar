@@ -13,6 +13,7 @@ from whale_radar.cluster import cluster
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
 from whale_radar.entity import entity
+from whale_radar.handoff import handoff
 from whale_radar.layering import layering
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
@@ -3850,6 +3851,338 @@ class EntityCliTests(unittest.TestCase):
         ):
             proc = subprocess.run(
                 invocation, input=body, capture_output=True, text=True,
+                cwd=root,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            results.append(proc.stdout)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+
+
+class HandoffTests(unittest.TestCase):
+    def handoff_query(self, transfers, routes=None, threshold=10000.0,
+                      window_seconds=3600, min_usd_value=0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["handoff_query"] = {
+            "window_seconds": window_seconds,
+            "min_usd_value": min_usd_value,
+        }
+        return result
+
+    def pair(self, s_usd=50000, d_usd=20000, s_ts=BASE_TS,
+             d_ts="2026-10-04T10:30:00Z", s_chain="eth", d_chain="bsc",
+             asset="USDT", s_id="s", d_id="d"):
+        return [
+            tx(s_id, "A", "X", chain=s_chain, asset=asset, usd=s_usd, ts=s_ts),
+            tx(d_id, "X", "B", chain=d_chain, asset=asset, usd=d_usd, ts=d_ts),
+        ]
+
+    def test_fields_score_drop_and_segments(self):
+        data = handoff(self.handoff_query(self.pair()))
+        self.assertEqual(set(data), {"handoffs", "alerts"})
+        self.assertEqual(len(data["handoffs"]), 1)
+        item = data["handoffs"][0]
+        self.assertEqual(
+            set(item),
+            {"source_address", "source_chain", "source_amount",
+             "source_usd_value", "destination_address", "destination_chain",
+             "destination_amount", "destination_usd_value", "intermediary",
+             "asset", "transfer_ids", "event_id", "amount_delta", "usd_delta",
+             "usd_value", "score", "reason", "segments"},
+        )
+        self.assertEqual(item["source_address"], "A")
+        self.assertEqual(item["source_chain"], "eth")
+        self.assertEqual(item["source_usd_value"], 50000)
+        self.assertEqual(item["destination_address"], "B")
+        self.assertEqual(item["destination_chain"], "bsc")
+        self.assertEqual(item["destination_usd_value"], 20000)
+        self.assertEqual(item["intermediary"], "X")
+        self.assertEqual(item["asset"], "USDT")
+        self.assertEqual(item["transfer_ids"], ["s", "d"])
+        self.assertEqual(item["event_id"], "s>d")
+        self.assertEqual(item["amount_delta"], 0)
+        self.assertEqual(item["usd_delta"], -30000)
+        self.assertEqual(item["usd_value"], 50000)
+        # 40 + 40 + 15 + 10（下降）= 105，截到 100。
+        self.assertEqual(item["score"], 100)
+        self.assertEqual(
+            item["reason"],
+            ["CROSS_CHAIN_HANDOFF", "VALUE", "VALUE_DROP"],
+        )
+        self.assertEqual(
+            item["segments"],
+            [
+                {"transfer_id": "s", "score": 40, "reason": ["VALUE"]},
+                {"transfer_id": "d", "score": 40, "reason": ["VALUE"]},
+            ],
+        )
+
+    def test_no_drop_keeps_base_points_and_order(self):
+        data = handoff(self.handoff_query(self.pair(s_usd=20000, d_usd=50000)))
+        item = data["handoffs"][0]
+        # 40 + 40 + 15 = 95，无 VALUE_DROP；delta 为正。
+        self.assertEqual(item["score"], 95)
+        self.assertEqual(item["reason"], ["CROSS_CHAIN_HANDOFF", "VALUE"])
+        self.assertEqual(item["usd_delta"], 30000)
+        self.assertEqual(item["usd_value"], 50000)
+
+    def test_window_closed_boundary(self):
+        transfers = self.pair(s_ts="2026-10-04T10:00:00Z",
+                              d_ts="2026-10-04T11:00:00Z")
+        data = handoff(self.handoff_query(transfers, window_seconds=3600))
+        self.assertEqual([h["event_id"] for h in data["handoffs"]], ["s>d"])
+        data = handoff(self.handoff_query(transfers, window_seconds=3599))
+        self.assertEqual(data["handoffs"], [])
+
+    def test_reverse_time_order_still_detected(self):
+        transfers = list(reversed(self.pair()))
+        data = handoff(self.handoff_query(transfers))
+        self.assertEqual(
+            [h["event_id"] for h in data["handoffs"]], ["s>d"]
+        )
+
+    def test_min_usd_value_applies_to_second_inclusive(self):
+        transfers = self.pair(d_usd=20000)
+        self.assertEqual(
+            len(handoff(self.handoff_query(transfers, min_usd_value=20000))[
+                "handoffs"]),
+            1,
+        )
+        self.assertEqual(
+            handoff(self.handoff_query(transfers, min_usd_value=20001))[
+                "handoffs"],
+            [],
+        )
+
+    def test_same_chain_self_asset_and_no_join_excluded(self):
+        same_chain = self.pair(s_chain="eth", d_chain="eth")
+        self.assertEqual(handoff(self.handoff_query(same_chain))["handoffs"], [])
+        self_transfer = [tx("s", "X", "X", chain="eth", asset="USDT", usd=50000),
+                         tx("d", "X", "B", chain="bsc", asset="USDT", usd=50000)]
+        self.assertEqual(
+            handoff(self.handoff_query(self_transfer))["handoffs"], []
+        )
+        other_asset = self.pair()
+        other_asset[1]["asset"] = "BTC"
+        self.assertEqual(
+            handoff(self.handoff_query(other_asset))["handoffs"], []
+        )
+        no_join = [tx("s", "A", "Y", chain="eth", asset="USDT", usd=50000),
+                   tx("d", "X", "B", chain="bsc", asset="USDT", usd=50000)]
+        self.assertEqual(handoff(self.handoff_query(no_join))["handoffs"], [])
+
+    def test_two_orientations_at_equal_timestamp_share_event_id(self):
+        transfers = [
+            tx("a", "X", "A", chain="eth", asset="USDT", usd=10000),
+            tx("b", "A", "X", chain="bsc", asset="USDT", usd=10000),
+        ]
+        data = handoff(self.handoff_query(transfers, routes=[route("r", 0, "info")]))
+        self.assertEqual(len(data["handoffs"]), 2)
+        self.assertTrue(all(h["event_id"] == "a>b" for h in data["handoffs"]))
+        self.assertEqual({h["intermediary"] for h in data["handoffs"]}, {"A", "X"})
+        # 每个 route/event 至多一项告警。
+        self.assertEqual(len(data["alerts"]), 1)
+        self.assertEqual(
+            data["alerts"][0],
+            {"route_id": "r", "event_id": "a>b", "severity": "info",
+             "score": data["handoffs"][0]["score"], "reason": data["handoffs"][0]["reason"],
+             "intermediary": data["handoffs"][0]["intermediary"],
+             "target": "ops"},
+        )
+
+    def test_alert_chains_must_hit_both_ends_and_asset_match(self):
+        transfers = self.pair()
+        only_eth = [route("r", 0, "info", chains=("eth",))]
+        self.assertEqual(
+            handoff(self.handoff_query(transfers, routes=only_eth))["alerts"],
+            [],
+        )
+        both = [route("r", 0, "info", chains=("eth", "bsc"))]
+        self.assertEqual(
+            len(handoff(self.handoff_query(transfers, routes=both))["alerts"]),
+            1,
+        )
+        star = [route("r", 0, "info")]
+        self.assertEqual(
+            len(handoff(self.handoff_query(transfers, routes=star))["alerts"]),
+            1,
+        )
+        other_asset = [route("r", 0, "info", assets=("BTC",))]
+        self.assertEqual(
+            handoff(self.handoff_query(transfers, routes=other_asset))["alerts"],
+            [],
+        )
+
+    def test_sorted_score_desc_then_event_id_asc(self):
+        transfers = [
+            tx("hi1", "A", "X", chain="eth", asset="USDT", usd=100000,
+               ts=BASE_TS),
+            tx("hi2", "X", "B", chain="bsc", asset="USDT", usd=100000,
+               ts="2026-10-04T10:01:00Z"),
+            tx("lo1", "C", "Y", chain="eth", asset="USDT", usd=0,
+               ts=BASE_TS),
+            tx("lo2", "Y", "D", chain="bsc", asset="USDT", usd=0,
+               ts="2026-10-04T10:01:00Z"),
+        ]
+        data = handoff(self.handoff_query(transfers))
+        self.assertEqual(
+            [h["event_id"] for h in data["handoffs"]],
+            ["hi1>hi2", "lo1>lo2"],
+        )
+        self.assertEqual(data["handoffs"][1]["score"], 15)
+
+    def assert_handoff_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            handoff(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_handoff_query_errors(self):
+        base = self.pair()
+        self.assert_handoff_code("INVALID_HANDOFF_QUERY", payload(base))
+        for field in ("window_seconds", "min_usd_value"):
+            bad = self.handoff_query(base)
+            del bad["handoff_query"][field]
+            self.assert_handoff_code("INVALID_HANDOFF_QUERY", bad)
+        bad = self.handoff_query(base)
+        bad["handoff_query"]["unknown"] = 1
+        self.assert_handoff_code("INVALID_HANDOFF_QUERY", bad)
+        for raw in ([], "x", 1, None, True):
+            bad = self.handoff_query(base)
+            bad["handoff_query"] = raw
+            self.assert_handoff_code("INVALID_HANDOFF_QUERY", bad)
+        for bad_value in (0, -1, 86401, 3600.0, "5", True, None):
+            self.assert_handoff_code(
+                "INVALID_HANDOFF_QUERY",
+                self.handoff_query(base, window_seconds=bad_value),
+            )
+        for bad_value in (-0.01, "0", True, None,
+                          float("inf"), float("nan")):
+            self.assert_handoff_code(
+                "INVALID_HANDOFF_QUERY",
+                self.handoff_query(base, min_usd_value=bad_value),
+            )
+        # 边界合法。
+        handoff(self.handoff_query(base, window_seconds=1, min_usd_value=0))
+        handoff(self.handoff_query(base, window_seconds=86400,
+                                   min_usd_value=0.0))
+
+    def test_error_precedence(self):
+        # threshold -> route -> handoff_query -> scoring。
+        bad = self.handoff_query([], threshold=0, window_seconds=0)
+        self.assert_handoff_code("INVALID_THRESHOLD", bad)
+        bad = self.handoff_query([], routes=[route("r", 200, "info")],
+                                 window_seconds=0)
+        self.assert_handoff_code("INVALID_ROUTE", bad)
+        bad = self.handoff_query([], window_seconds=0)
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_handoff_code("INVALID_HANDOFF_QUERY", bad)
+        bad = self.handoff_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_handoff_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_scoring_changes_segment_scores(self):
+        bad_scoring = {"value_points_per_ratio": 0}
+        body = self.handoff_query(self.pair(s_usd=10000, d_usd=10000))
+        body["scoring"] = bad_scoring
+        item = handoff(body)["handoffs"][0]
+        # 逐段 VALUE 归零后仅剩 15 基分。
+        self.assertEqual(item["score"], 15)
+        self.assertEqual(item["segments"][0]["score"], 0)
+
+
+class HandoffCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "handoff"], input=raw, capture_output=True, text=True
+        )
+
+    def body(self, **kwargs):
+        transfers = [
+            tx("t1", "A", "X", chain="eth", asset="USDT", usd=50000),
+            tx("t2", "X", "B", chain="bsc", asset="USDT", usd=20000),
+        ]
+        body = {
+            "transfers": transfers, "whale_threshold_usd": 10000,
+            "routes": [route("r", 80, "critical")],
+            "handoff_query": {"window_seconds": 3600, "min_usd_value": 0},
+        }
+        body.update(kwargs)
+        return body
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(self.body()))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"handoffs", "alerts"})
+        item = out["data"]["handoffs"][0]
+        self.assertEqual(item["event_id"], "t1>t2")
+        self.assertEqual(item["score"], 100)
+        alert = out["data"]["alerts"][0]
+        self.assertEqual(
+            set(alert),
+            {"route_id", "event_id", "intermediary", "severity", "score",
+             "reason", "target"},
+        )
+        self.assertEqual(alert["intermediary"], "X")
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"))
+
+    def test_empty_handoffs_and_alerts(self):
+        body = self.body()
+        body["transfers"] = []
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"handoffs": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = self.body()
+        body["handoff_query"]["window_seconds"] = 0
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_HANDOFF_QUERY"}
+        )
+
+    def test_non_ascii_round_trip(self):
+        body = self.body()
+        body["transfers"] = [
+            tx("t1", "甲", "中转", chain="以太坊", asset="U", usd=50000),
+            tx("t2", "中转", "乙", chain="bsc", asset="U", usd=20000,
+               ts="2026-10-04T10:30:00Z"),
+        ]
+        proc = self.run_cli(json.dumps(body, ensure_ascii=False))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = json.loads(proc.stdout)["data"]["handoffs"][0]
+        self.assertEqual(item["intermediary"], "中转")
+        self.assertEqual(item["source_chain"], "以太坊")
+
+    def test_three_entry_points_equivalent(self):
+        raw = json.dumps(self.body())
+        results = []
+        root = os.path.dirname(os.path.dirname(BIN))
+        for invocation in (
+            [os.path.join(root, "whale-radar"), "handoff"],
+            [sys.executable, "-m", "whale_radar", "handoff"],
+            [BIN, "handoff"],
+        ):
+            proc = subprocess.run(
+                invocation, input=raw, capture_output=True, text=True,
                 cwd=root,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)

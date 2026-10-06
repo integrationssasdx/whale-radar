@@ -8,8 +8,8 @@
 
 ## 状态
 
-基线已含 analyze、trace、trace-risk、rank、entity、watch、converge、cycles、
-layering、cluster 十个子命令的分析实现，以及仓库根目录的产品入口与
+基线已含 analyze、trace、trace-risk、rank、entity、handoff、watch、converge、
+cycles、layering、cluster 十一个子命令的分析实现，以及仓库根目录的产品入口与
 `python -m whale_radar` 模块入口。
 
 ## 约定
@@ -36,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-十个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+十一个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -75,6 +75,32 @@ stdout 为空，退出码 2。
   > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
   > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
   > INVALID_ENTITY_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar handoff`：同一资产经共同中间地址跨链交接（handoffs）与按
+  route/event 聚合的告警（alerts）。输入沿用 analyze 的 transfers、
+  whale_threshold_usd、routes 与可选 scoring，外加 `handoff_query` 对象：
+  `window_seconds`（1..86400 整数）与 `min_usd_value`（非负有限数），二者
+  缺一不可、不接受未知字段与布尔值。交接由两笔非自转账构成：id 互异、资产
+  相同、链不同、首笔 `to_address` 等于次笔 `from_address`（共同地址即
+  intermediary，资金经其中转）、时间差 Δt∈[0,window_seconds]（闭区间，两个
+  时间方向各检查一次）、次笔 usd_value≥min_usd_value（等值保留）。每项含
+  source_address、source_chain、source_amount、source_usd_value、
+  destination_address、destination_chain、destination_amount、
+  destination_usd_value、intermediary、asset、transfer_ids、event_id、
+  amount_delta、usd_delta、usd_value、score、reason、segments；transfer_ids
+  与 segments 按 (timestamp, id) 排序，event_id 以 `>` 连接为 id1>id2，
+  amount_delta/usd_delta 为次-首，usd_value 取两端最大值，金额与 score 保留
+  10 位小数。score=analyze 两笔逐段分 s1+s2+15，次笔美元低于首笔时再加 10，
+  总分截到 0..100；reason 以 CROSS_CHAIN_HANDOFF 起，再按 VALUE、BURST、
+  FAN_OUT、ROUND_TRIP 合并去重，下降时追加 VALUE_DROP；segments 每项恰含
+  transfer_id、score、reason（score 为 analyze 同一 scoring 配置下的逐笔
+  0..100 分并保留 10 位小数）。handoffs 按 score 降序、event_id 升序排序，
+  空时保留空数组。alerts 每个 route/event 至多一项，score≥route.min_score，
+  route.chains 同时命中 source_chain 与 destination_chain 两端、route.assets
+  命中 asset（均支持 `*`）时生成；每项含 route_id、event_id、intermediary、
+  severity、score、reason、target，按 route_id、event_id 排序。handoff 的
+  错误码顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA >
+  DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
+  > INVALID_ROUTE > INVALID_HANDOFF_QUERY > INVALID_SCORING_CONFIG。
 - `whale-radar watch`：关注地址间的协同资金流（paths）与按 route/path
   聚合的告警（alerts）。输入沿用 analyze 的 transfers、whale_threshold_usd、
   routes 与可选 scoring，外加至少两个互异非空字符串的 `watch_addresses`
@@ -186,7 +212,8 @@ stdout 为空，退出码 2。
 
 ## scoring 配置
 
-`analyze`、`trace-risk`、`rank`、`entity`、`watch`、`cycles`、`layering`
+`analyze`、`trace-risk`、`rank`、`entity`、`handoff`、`watch`、`cycles`、
+`layering`
 接受可选的
 顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
@@ -221,12 +248,13 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 告警去重与稳定排序均不随配置改变。
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
-analyze、trace-risk、rank、entity、watch、converge、cycles、layering
-八个命令均向
+analyze、trace-risk、rank、entity、handoff、watch、converge、cycles、
+layering 九个命令均向
 stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
 退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：
 analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
-INVALID_TRACE_QUERY，entity 中晚于 INVALID_ENTITY_QUERY，watch 中晚于
-INVALID_WATCH_QUERY，converge 中晚于 INVALID_CONVERGENCE_QUERY，cycles
-中晚于 INVALID_CYCLE_QUERY，layering 中晚于 INVALID_LAYERING_QUERY；
+INVALID_TRACE_QUERY，entity 中晚于 INVALID_ENTITY_QUERY，handoff 中晚于
+INVALID_HANDOFF_QUERY，watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
+INVALID_CONVERGENCE_QUERY，cycles 中晚于 INVALID_CYCLE_QUERY，layering 中晚于
+INVALID_LAYERING_QUERY；
 `trace` 永不产生此错误。
