@@ -12,6 +12,7 @@ from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.cluster import cluster
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
+from whale_radar.entity import entity
 from whale_radar.layering import layering
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
@@ -3464,6 +3465,397 @@ class ClusterCliTests(unittest.TestCase):
         self.assertEqual(
             out["data"]["clusters"][0]["cluster_id"], "转甲>转乙"
         )
+
+
+def entities_payload(transfers, entities=None, threshold=10000.0, routes=None):
+    if entities is None:
+        entities = [
+            {"id": "E" + addr, "addresses": [addr]}
+            for addr in sorted({
+                a for t in transfers
+                for a in (t["from_address"], t["to_address"])
+            })
+        ]
+    return {
+        "transfers": transfers,
+        "whale_threshold_usd": threshold,
+        "routes": routes or [],
+        "entities": entities,
+    }
+
+
+class EntityTests(unittest.TestCase):
+    def test_internal_transfer_double_counts_same_entity_no_counterparty(self):
+        data = entity(entities_payload([
+            tx("i1", "A", "B", usd=100),
+            tx("i2", "B", "A", usd=30),
+            tx("s1", "S", "S", usd=90000),
+        ], entities=[
+            {"id": "E1", "addresses": ["A", "B"]},
+            {"id": "E2", "addresses": ["S"]},
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["E1"]["addresses"], ["A", "B"])
+        self.assertEqual(prof["E1"]["sent_usd"], 130)
+        self.assertEqual(prof["E1"]["received_usd"], 130)
+        self.assertEqual(prof["E1"]["net_usd"], 0)
+        self.assertEqual(prof["E1"]["whale_transfers"], 0)
+        self.assertEqual(prof["E1"]["counterparties"], [])
+        # 实体内自转账巨鲸只触及该实体一次。
+        self.assertEqual(prof["E2"]["whale_transfers"], 1)
+        self.assertEqual(prof["E2"]["counterparties"], [])
+        self.assertEqual(prof["E2"]["sent_usd"], 90000)
+        self.assertEqual(prof["E2"]["received_usd"], 90000)
+
+    def test_cross_entity_aggregation_and_whale_touches_both(self):
+        data = entity(entities_payload([
+            tx("lo", "A", "B", usd=9999.99),
+            tx("hi", "C", "D", usd=10000),
+        ], entities=[
+            {"id": "E1", "addresses": ["A", "C"]},
+            {"id": "E2", "addresses": ["B", "D"]},
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["E1"]["sent_usd"], 19999.99)
+        self.assertEqual(prof["E1"]["received_usd"], 0)
+        self.assertEqual(prof["E1"]["whale_transfers"], 1)
+        self.assertEqual(prof["E2"]["whale_transfers"], 1)
+        self.assertEqual(prof["E1"]["counterparties"], ["E2"])
+        self.assertEqual(prof["E2"]["counterparties"], ["E1"])
+        self.assertEqual(prof["E1"]["risk_score"], 40)
+        self.assertEqual(prof["E1"]["reasons"], ["WHALE_EXPOSURE"])
+
+    def test_counterparty_distribution_counts_distinct_entities(self):
+        transfers = [
+            tx("t%d" % i, "A", "r%d" % i, usd=1,
+               ts="2026-10-04T10:%02d:00Z" % (i * 10))
+            for i in range(3)
+        ]
+        # 三个收款地址归入同一实体：对手实体只有 1 个。
+        data = entity(entities_payload(transfers, entities=[
+            {"id": "E1", "addresses": ["A"]},
+            {"id": "E2", "addresses": ["r0", "r1", "r2"]},
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["E1"]["counterparties"], ["E2"])
+        self.assertNotIn("COUNTERPARTY_DISTRIBUTION", prof["E1"]["reasons"])
+
+        # 三个收款地址各自成实体：对手实体为 3 个，命中对手分布。
+        data = entity(entities_payload(transfers))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["EA"]["counterparties"],
+                         ["Er0", "Er1", "Er2"])
+        self.assertIn("COUNTERPARTY_DISTRIBUTION", prof["EA"]["reasons"])
+
+    def test_round_trip_requires_distinct_entities(self):
+        data = entity(entities_payload([
+            tx("out", "A", "B", amount=7.0, asset="USDC"),
+            tx("back", "B", "A", amount=7.0, asset="USDC",
+               ts="2026-10-04T11:00:00Z"),
+            tx("xout", "X", "Y", amount=7.0, asset="USDC",
+               ts="2026-10-04T11:30:00Z"),
+            tx("xback", "Y", "X", amount=7.0, asset="USDC",
+               ts="2026-10-04T11:45:00Z"),
+        ], entities=[
+            {"id": "E1", "addresses": ["A", "B"]},
+            {"id": "E2", "addresses": ["X"]},
+            {"id": "E3", "addresses": ["Y"]},
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        # 同实体往返不算；X/Y 分属不同实体才命中。
+        self.assertNotIn("ROUND_TRIP_ACTIVITY", prof["E1"]["reasons"])
+        self.assertIn("ROUND_TRIP_ACTIVITY", prof["E2"]["reasons"])
+        self.assertIn("ROUND_TRIP_ACTIVITY", prof["E3"]["reasons"])
+
+    def test_round_trip_requires_same_asset_equal_amount(self):
+        data = entity(entities_payload([
+            tx("out", "A", "B", amount=7.0, asset="USDC"),
+            tx("back", "B", "A", amount=8.0, asset="USDC",
+               ts="2026-10-04T11:00:00Z"),
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertNotIn("ROUND_TRIP_ACTIVITY", prof["EA"]["reasons"])
+
+    def test_burst_uses_entity_send_times_closed_window(self):
+        transfers = [
+            tx("t1", "a1", "x0", usd=1),
+            tx("t2", "a2", "x1", usd=1, ts="2026-10-04T10:30:00Z"),
+            tx("t3", "a1", "x2", usd=1, ts="2026-10-04T10:45:00Z"),
+            tx("t4", "a2", "x3", usd=1, ts="2026-10-04T10:59:00Z"),
+            tx("t5", "a1", "x4", usd=1, ts="2026-10-04T11:00:00Z"),
+        ]
+        data = entity(entities_payload(transfers, entities=[
+            {"id": "E1", "addresses": ["a1", "a2"]},
+        ] + [
+            {"id": "E" + x, "addresses": [x]}
+            for x in ["x0", "x1", "x2", "x3", "x4"]
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertIn("BURST_ACTIVITY", prof["E1"]["reasons"])
+        self.assertNotIn("BURST_ACTIVITY", prof["Ex0"]["reasons"])
+
+    def test_profiles_sorted_score_desc_entity_id_asc(self):
+        data = entity(entities_payload([
+            tx("w1", "Z", "x1", usd=100000),
+            tx("w2", "A", "x2", usd=100000),
+        ]))
+        self.assertEqual(
+            [(p["entity_id"], p["risk_score"]) for p in data["profiles"][:2]],
+            [("EA", 40), ("EZ", 40)],
+        )
+
+    def test_score_clamped_and_reason_order(self):
+        transfers = [
+            tx("w", "A", "B", amount=3.0, asset="ETH", usd=100000),
+            tx("c2", "A", "C", usd=1, ts="2026-10-04T10:05:00Z"),
+            tx("c3", "A", "D", usd=1, ts="2026-10-04T10:10:00Z"),
+            tx("b2", "B", "A", amount=3.0, asset="ETH", usd=1,
+               ts="2026-10-04T10:15:00Z"),
+            tx("c4", "A", "E", usd=1, ts="2026-10-04T10:20:00Z"),
+            tx("c5", "A", "F", usd=1, ts="2026-10-04T10:25:00Z"),
+        ]
+        data = entity(entities_payload(transfers, threshold=10000))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["EA"]["risk_score"], 100)
+        self.assertEqual(
+            prof["EA"]["reasons"],
+            ["WHALE_EXPOSURE", "COUNTERPARTY_DISTRIBUTION",
+             "ROUND_TRIP_ACTIVITY", "BURST_ACTIVITY"],
+        )
+
+    def test_declared_addresses_not_in_transfers_still_profiled(self):
+        data = entity(entities_payload([
+            tx("t1", "A", "B", usd=1),
+        ], entities=[
+            {"id": "E1", "addresses": ["A", "Z"]},
+            {"id": "E2", "addresses": ["B"]},
+        ]))
+        prof = {p["entity_id"]: p for p in data["profiles"]}
+        self.assertEqual(prof["E1"]["addresses"], ["A", "Z"])
+        self.assertEqual(prof["E1"]["sent_usd"], 1)
+        self.assertEqual(prof["E1"]["received_usd"], 0)
+
+    def test_alerts_one_per_route_entity_and_sorting(self):
+        routes = [
+            route("r2", 40, "warning", chains=("eth",), target="email"),
+            route("r1", 40, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+        ]
+        data = entity(entities_payload([
+            tx("w1", "A", "B", usd=50000, chain="eth", asset="ETH"),
+            tx("w2", "C", "D", usd=50000, chain="btc", asset="BTC"),
+        ], threshold=10000, routes=routes, entities=[
+            {"id": "E1", "addresses": ["A", "C"]},
+            {"id": "E2", "addresses": ["B", "D"]},
+        ]))
+        alerts = data["alerts"]
+        # 实体 E1/E2 各自同时触及 eth 与 btc；eth 路由命中，btc 不命中。
+        self.assertEqual(
+            [(a["route_id"], a["entity_id"]) for a in alerts],
+            [("r1", "E1"), ("r1", "E2"), ("r2", "E1"), ("r2", "E2")],
+        )
+        first = alerts[0]
+        self.assertEqual(set(first),
+                         {"route_id", "entity_id", "severity", "score",
+                          "reason", "target"})
+        self.assertEqual(first["score"], 40)
+        self.assertEqual(first["target"], "pager")
+
+    def test_alert_match_requires_single_transfer_hit_both(self):
+        data = entity(entities_payload([
+            tx("e", "P", "Q", usd=50000, chain="eth", asset="ETH"),
+            tx("u", "Q", "P", usd=50000, chain="bsc", asset="USDC",
+               ts="2026-10-04T10:30:00Z"),
+        ], routes=[route("r", 40, "info", chains=("eth",),
+                         assets=("USDC",))]))
+        self.assertEqual(data["alerts"], [])
+
+    def test_alert_min_score_inclusive(self):
+        data = entity(entities_payload(
+            [tx("w", "A", "B", usd=10000)], threshold=10000,
+            routes=[route("r", 40, "info")]))
+        self.assertEqual(
+            [a["entity_id"] for a in data["alerts"]], ["EA", "EB"])
+
+    def test_entity_query_errors(self):
+        def assert_code(code, body):
+            with self.assertRaises(AnalyzeError) as ctx:
+                entity(body)
+            self.assertEqual(ctx.exception.code, code)
+
+        base = entities_payload([tx("t1", "A", "B")])
+
+        bad = dict(base)
+        del bad["entities"]
+        assert_code("INVALID_ENTITY_QUERY", bad)
+
+        assert_code("INVALID_ENTITY_QUERY", {**base, "entities": []})
+        assert_code("INVALID_ENTITY_QUERY", {**base, "entities": {}})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [{"id": "E1"}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [{"addresses": ["A"]}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A"], "extra": 1}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "", "addresses": ["A"]}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": 1, "addresses": ["A"]}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": []}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A", "A"]}]})
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A", ""]}]})
+        # 地址跨实体重复。
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A", "B"]},
+                        {"id": "E2", "addresses": ["B"]}]})
+        # id 重复。
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A"]},
+                        {"id": "E1", "addresses": ["B"]}]})
+        # 未覆盖全部转账地址（缺 B）。
+        assert_code("INVALID_ENTITY_QUERY",
+                    {**base, "entities": [
+                        {"id": "E1", "addresses": ["A"]},
+                        {"id": "E2", "addresses": ["X"]}]})
+        # 出现未参与转账的地址是允许的（仅要求覆盖转账地址）。
+        ok = dict(base, entities=[
+            {"id": "E1", "addresses": ["A", "Z"]},
+            {"id": "E2", "addresses": ["B"]},
+        ])
+        entity(ok)
+
+    def test_error_precedence(self):
+        def assert_code(code, body):
+            with self.assertRaises(AnalyzeError) as ctx:
+                entity(body)
+            self.assertEqual(ctx.exception.code, code)
+
+        # 结构/转账/阈值/路由错误先于实体错误。
+        assert_code("INVALID_INPUT_SCHEMA", {"transfers": []})
+        assert_code(
+            "DUPLICATE_TRANSFER_ID",
+            entities_payload([tx("dup", "A", "B"),
+                              tx("dup", "A", "B", ts="bad")]),
+        )
+        assert_code(
+            "INVALID_TRANSFER_VALUE",
+            entities_payload([tx("t", "A", "B", amount=0)]),
+        )
+        assert_code(
+            "INVALID_THRESHOLD",
+            entities_payload([], threshold=0,
+                             routes=[route("r", 50, "info")]),
+        )
+        assert_code(
+            "INVALID_ROUTE",
+            entities_payload([], routes=[route("r", 101, "info")]),
+        )
+        # 实体错误先于 scoring 错误。
+        body = entities_payload([tx("t1", "A", "B")])
+        del body["entities"]
+        body["scoring"] = {"window_seconds": 0}
+        assert_code("INVALID_ENTITY_QUERY", body)
+        # 实体合法后才报 scoring。
+        assert_code(
+            "INVALID_SCORING_CONFIG",
+            {**entities_payload([tx("t1", "A", "B")]),
+             "scoring": {"window_seconds": 0}},
+        )
+
+
+class EntityCliTests(unittest.TestCase):
+    def run_cli(self, raw, cmd=None):
+        return subprocess.run(
+            [BIN, cmd or "entity"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(
+            entities_payload([tx("t1", "A", "B", usd=10000)])))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"profiles", "alerts"})
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_alerts(self):
+        proc = self.run_cli(json.dumps(entities_payload([])))
+        # 无转账时实体不可覆盖任何地址：entities 也必须为空列表，非法。
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_ENTITY_QUERY"}
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INPUT_NOT_JSON"})
+
+    def test_error_code_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_INPUT_SCHEMA"})
+
+        bad = entities_payload([tx("t1", "A", "B")])
+        bad["entities"] = [{"id": "E1", "addresses": ["A"]}]
+        proc = self.run_cli(json.dumps(bad))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_ENTITY_QUERY"}
+        )
+
+    def test_non_ascii_round_trip(self):
+        body = entities_payload([
+            tx("转甲", "地址甲", "地址乙", usd=10000),
+            tx("转乙", "实体乙", "实体甲", usd=10000,
+               ts="2026-10-04T10:30:00Z"),
+        ], entities=[
+            {"id": "实体甲", "addresses": ["地址甲", "实体甲"]},
+            {"id": "实体乙", "addresses": ["地址乙", "实体乙"]},
+        ])
+        proc = self.run_cli(json.dumps(body, ensure_ascii=False))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        # 两实体同为 40 分，按 entity_id 升序（乙 U+4E59 在甲 U+7532 前）。
+        self.assertEqual(
+            [p["entity_id"] for p in out["data"]["profiles"]],
+            ["实体乙", "实体甲"],
+        )
+
+    def test_three_entry_points_equivalent(self):
+        body = json.dumps(entities_payload(
+            [tx("w1", "A", "B", usd=50000)],
+            routes=[route("r", 40, "info")]))
+        results = []
+        root = os.path.dirname(os.path.dirname(BIN))
+        for invocation in (
+            [os.path.join(root, "whale-radar"), "entity"],
+            [sys.executable, "-m", "whale_radar", "entity"],
+            [BIN, "entity"],
+        ):
+            proc = subprocess.run(
+                invocation, input=body, capture_output=True, text=True,
+                cwd=root,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            results.append(proc.stdout)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
 
 
 if __name__ == "__main__":
