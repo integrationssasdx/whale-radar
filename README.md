@@ -8,8 +8,9 @@
 
 ## 状态
 
-基线已含 analyze、trace、trace-risk、rank、watch、converge、cycles 七个子命令的
-分析实现，以及仓库根目录的产品入口与 `python -m whale_radar` 模块入口。
+基线已含 analyze、trace、trace-risk、rank、watch、converge、cycles、
+layering 八个子命令的分析实现，以及仓库根目录的产品入口与
+`python -m whale_radar` 模块入口。
 
 ## 约定
 
@@ -35,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-七个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+八个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -113,11 +114,37 @@ stdout 为空，退出码 2。
   cycles 的错误码顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA
   > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
   > INVALID_ROUTE > INVALID_CYCLE_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar layering`：同一地址先归集多方资金再向外分发的分层事件
+  （layering）与按 route/event 聚合的告警（alerts）。输入沿用 analyze 的
+  transfers、whale_threshold_usd、routes 与可选 scoring，外加
+  `layering_query` 对象：`window_seconds`（1..10000 整数）、`min_sources`
+  （2..10000 整数）、`min_recipients`（2..10000 整数）、`min_usd_value`
+  （非负有限数），四者缺一不可、不接受未知字段与布尔值。转账按
+  (chain, asset) 分组；组内以每笔转入某中心地址的非自转账的 timestamp
+  为起点，纳入 timestamp 到 timestamp+window_seconds 闭区间内该地址的
+  转入与转出构成窗口，窗口内不同来源数>=min_sources、不同接收方数
+  >=min_recipients 且 usd_value 合计>=min_usd_value 时输出事件。自转账
+  不计来源、接收方或事件；同一地址产生相同 transfer_ids 的多个起点仅
+  保留最小起点 id 为 event_id。每项含 event_id、chain、asset、address、
+  transfer_ids、source_count、recipient_count、amount、usd_value、score、
+  reason、segments；transfer_ids 按 timestamp、id 排序，金额与 score
+  保留 10 位小数。score 为 analyze 逐段分值求和后截到 0..100，reason 按
+  VALUE、BURST、FAN_OUT、ROUND_TRIP 去重；segments 与 transfer_ids 同序
+  对应，每项恰含 transfer_id、score、reason，score 为 analyze 在同一
+  scoring 配置下的逐笔 0..100 分并保留 10 位小数，reason 按 VALUE、
+  BURST、FAN_OUT、ROUND_TRIP 去重。layering 按 score 降序，再按 chain、
+  asset、address、event_id 升序排序，空时保留空数组。alerts 每个
+  route/event 至多一项，score>=route.min_score 且 chains、assets 命中
+  星号规则时生成，字段沿用 cycles 告警（cycle_id 改为 event_id），按
+  route_id、event_id 排序。layering 的错误码顺序为 INPUT_NOT_JSON
+  > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
+  > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
+  > INVALID_LAYERING_QUERY > INVALID_SCORING_CONFIG。
 
 ## scoring 配置
 
-`analyze`、`trace-risk`、`rank`、`watch`、`cycles` 接受可选的顶层
-`scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
+`analyze`、`trace-risk`、`rank`、`watch`、`cycles`、`layering` 接受可选的
+顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
 `converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
 用于归集打分；`trace` 不做打分，`scoring`（即使字段未知或非法）对其
@@ -150,10 +177,10 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 告警去重与稳定排序均不随配置改变。
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
-analyze、trace-risk、rank、watch、converge、cycles 六个命令均向 stderr
-输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，退出码
-2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：analyze 与
-rank 中晚于 INVALID_ROUTE，trace-risk 中晚于 INVALID_TRACE_QUERY，
-watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
-INVALID_CONVERGENCE_QUERY，cycles 中晚于 INVALID_CYCLE_QUERY；
-`trace` 永不产生此错误。
+analyze、trace-risk、rank、watch、converge、cycles、layering 七个命令均向
+stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
+退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：
+analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
+INVALID_TRACE_QUERY，watch 中晚于 INVALID_WATCH_QUERY，converge 中晚于
+INVALID_CONVERGENCE_QUERY，cycles 中晚于 INVALID_CYCLE_QUERY，layering
+中晚于 INVALID_LAYERING_QUERY；`trace` 永不产生此错误。

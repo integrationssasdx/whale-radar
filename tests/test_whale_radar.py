@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
+from whale_radar.layering import layering
 from whale_radar.ranker import rank
 from whale_radar.risk import trace_risk
 from whale_radar.tracer import trace
@@ -2623,6 +2624,467 @@ class CycleCliTests(unittest.TestCase):
         out = json.loads(proc.stdout)
         self.assertEqual(
             out["data"]["cycles"][0]["cycle_id"], "转乙>转甲"
+        )
+
+
+class LayeringTests(unittest.TestCase):
+    def layering_query(self, transfers, routes=None, threshold=10000.0,
+                       window_seconds=3600, min_sources=2, min_recipients=2,
+                       min_usd_value=0):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["layering_query"] = {
+            "window_seconds": window_seconds,
+            "min_sources": min_sources,
+            "min_recipients": min_recipients,
+            "min_usd_value": min_usd_value,
+        }
+        return result
+
+    def test_collect_then_distribute_event(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", amount=1.0, usd=100),
+            tx("t2", "s2", "C", amount=2.0, usd=200,
+               ts="2026-10-04T10:00:10Z"),
+            tx("t3", "C", "r1", amount=1.0, usd=150,
+               ts="2026-10-04T10:00:20Z"),
+            tx("t4", "C", "r2", amount=1.0, usd=150,
+               ts="2026-10-04T10:00:30Z"),
+        ]))
+        self.assertEqual(set(data), {"layering", "alerts"})
+        events = data["layering"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(
+            set(event),
+            {"event_id", "chain", "asset", "address", "transfer_ids",
+             "source_count", "recipient_count", "amount", "usd_value",
+             "score", "reason", "segments"},
+        )
+        self.assertEqual(event["event_id"], "t1")
+        self.assertEqual(event["chain"], "eth")
+        self.assertEqual(event["asset"], "ETH")
+        self.assertEqual(event["address"], "C")
+        self.assertEqual(event["transfer_ids"], ["t1", "t2", "t3", "t4"])
+        self.assertEqual(event["source_count"], 2)
+        self.assertEqual(event["recipient_count"], 2)
+        self.assertEqual(event["amount"], 5)
+        self.assertEqual(event["usd_value"], 600)
+        # 逐段 VALUE：0.2+0.4+0.3+0.3 = 1.2。
+        self.assertEqual(event["score"], 1.2)
+        self.assertEqual(event["reason"], ["VALUE"])
+        self.assertEqual(
+            event["segments"],
+            [
+                {"transfer_id": "t1", "score": 0.2, "reason": ["VALUE"]},
+                {"transfer_id": "t2", "score": 0.4, "reason": ["VALUE"]},
+                {"transfer_id": "t3", "score": 0.3, "reason": ["VALUE"]},
+                {"transfer_id": "t4", "score": 0.3, "reason": ["VALUE"]},
+            ],
+        )
+
+    def test_window_closed_boundary_and_forward_only(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", usd=1),
+            tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:05:00Z"),
+            tx("t2", "s2", "C", usd=1, ts="2026-10-04T10:10:00Z"),
+            tx("o2", "C", "r2", usd=1, ts="2026-10-04T10:10:00Z"),
+            tx("t3", "s3", "C", usd=1, ts="2026-10-04T10:10:01Z"),
+        ], window_seconds=600))
+        events = data["layering"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["event_id"], "t1")
+        # 恰好 600 秒的 t2/o2 落在闭窗口内；601 秒的 t3 不在。
+        # transfer_ids 按 timestamp、id 排序：同刻 o2 在 t2 前。
+        self.assertEqual(event["transfer_ids"], ["t1", "o1", "o2", "t2"])
+        self.assertEqual(event["source_count"], 2)
+        self.assertEqual(event["recipient_count"], 2)
+
+    def test_self_transfer_not_source_recipient_or_anchor(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", usd=1),
+            tx("t2", "s2", "C", usd=1, ts="2026-10-04T10:00:10Z"),
+            tx("self", "C", "C", usd=1, ts="2026-10-04T10:00:15Z"),
+            tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", usd=1, ts="2026-10-04T10:00:30Z"),
+        ]))
+        events = data["layering"]
+        # self 不能作为事件起点；C 不计入来源或接收方。
+        self.assertEqual([e["event_id"] for e in events], ["t1"])
+        event = events[0]
+        self.assertEqual(event["source_count"], 2)
+        self.assertEqual(event["recipient_count"], 2)
+        self.assertEqual(
+            event["transfer_ids"], ["t1", "t2", "self", "o1", "o2"]
+        )
+
+    def test_groups_split_by_chain_and_asset(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", usd=1),
+            tx("t2", "s2", "C", usd=1, chain="bsc", asset="BNB"),
+            tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:00:10Z"),
+            tx("o2", "C", "r2", usd=1, asset="USDC",
+               ts="2026-10-04T10:00:20Z"),
+        ]))
+        self.assertEqual(data["layering"], [])
+
+    def test_min_thresholds_filters_and_boundaries(self):
+        transfers = [
+            tx("t1", "s1", "C", usd=100),
+            tx("t2", "s2", "C", usd=100, ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", usd=100, ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", usd=100, ts="2026-10-04T10:00:30Z"),
+        ]
+        data = layering(self.layering_query(transfers, min_sources=3))
+        self.assertEqual(data["layering"], [])
+        data = layering(self.layering_query(transfers, min_recipients=3))
+        self.assertEqual(data["layering"], [])
+        data = layering(self.layering_query(transfers, min_usd_value=401))
+        self.assertEqual(data["layering"], [])
+        # 边界等值命中（usd 合计 400）。
+        data = layering(self.layering_query(transfers, min_usd_value=400))
+        self.assertEqual(len(data["layering"]), 1)
+
+    def test_same_source_and_recipient_counted_once(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", usd=1),
+            tx("t2", "s1", "C", usd=1, ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r1", usd=1, ts="2026-10-04T10:00:30Z"),
+        ]))
+        self.assertEqual(data["layering"], [])
+
+    def test_same_window_keeps_smallest_anchor_id(self):
+        data = layering(self.layering_query([
+            tx("a2", "s1", "C", usd=1),
+            tx("a1", "s2", "C", usd=1),
+            tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:00:10Z"),
+            tx("o2", "C", "r2", usd=1, ts="2026-10-04T10:00:20Z"),
+        ]))
+        events = data["layering"]
+        # a1、a2 同刻起点产生相同 transfer_ids，仅留最小起点 id。
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], "a1")
+        self.assertEqual(
+            events[0]["transfer_ids"], ["a1", "a2", "o1", "o2"]
+        )
+
+    def test_reason_merged_dedup_in_fixed_order(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", amount=5.0, usd=0),
+            tx("t2", "s2", "C", amount=6.0, usd=0,
+               ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", amount=5.0, usd=0,
+               ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", amount=6.0, usd=0,
+               ts="2026-10-04T10:00:30Z"),
+            tx("b1", "r1", "C", amount=5.0, usd=0,
+               ts="2026-10-04T10:00:40Z"),
+        ], min_sources=3))
+        events = data["layering"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        # o1 与 b1 互为等 amount 反向转账：各 15 ROUND_TRIP，合计 30。
+        self.assertEqual(event["reason"], ["ROUND_TRIP"])
+        self.assertEqual(event["score"], 30)
+        self.assertEqual(event["source_count"], 3)
+        self.assertEqual(event["recipient_count"], 2)
+
+    def test_events_sorted_score_desc_chain_asset_address_event_id(self):
+        transfers = [
+            tx("e1", "s1", "C", usd=0),
+            tx("e2", "s2", "C", usd=0),
+            tx("e3", "C", "r1", usd=0, ts="2026-10-04T10:00:10Z"),
+            tx("e4", "C", "r2", usd=0, ts="2026-10-04T10:00:20Z"),
+            tx("b1", "s1", "D", usd=0, chain="bsc", asset="BNB"),
+            tx("b2", "s2", "D", usd=0, chain="bsc", asset="BNB"),
+            tx("b3", "D", "r1", usd=0, chain="bsc", asset="BNB",
+               ts="2026-10-04T10:00:10Z"),
+            tx("b4", "D", "r2", usd=0, chain="bsc", asset="BNB",
+               ts="2026-10-04T10:00:20Z"),
+            tx("h1", "s1", "B", usd=10000),
+            tx("h2", "s2", "B", usd=10000),
+            tx("h3", "B", "r1", usd=10000, ts="2026-10-04T10:00:10Z"),
+            tx("h4", "B", "r2", usd=10000, ts="2026-10-04T10:00:20Z"),
+        ]
+        data = layering(self.layering_query(transfers))
+        # h 事件 80 分居首；同分 0 按 chain、asset、address、event_id 升序。
+        self.assertEqual(
+            [(e["chain"], e["asset"], e["address"], e["event_id"])
+             for e in data["layering"]],
+            [("eth", "ETH", "B", "h1"),
+             ("bsc", "BNB", "D", "b1"),
+             ("eth", "ETH", "C", "e1")],
+        )
+
+    def test_amount_usd_round10_representation(self):
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", amount=0.1, usd=0.2),
+            tx("t2", "s2", "C", amount=0.2, usd=0.1,
+               ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", amount=0.1, usd=0.1,
+               ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", amount=0.1, usd=0.1,
+               ts="2026-10-04T10:00:30Z"),
+        ]))
+        event = data["layering"][0]
+        self.assertEqual(event["amount"], 0.5)
+        self.assertEqual(event["usd_value"], 0.5)
+
+    def test_empty_events_keep_arrays(self):
+        data = layering(self.layering_query([]))
+        self.assertEqual(data, {"layering": [], "alerts": []})
+
+    def test_alerts_one_per_route_event_and_sorted(self):
+        routes = [
+            route("r2", 40, "warning", chains=("eth",), target="email"),
+            route("r1", 80, "critical", chains=("eth",), assets=("ETH",),
+                  target="pager"),
+            route("r-btc", 0, "info", chains=("btc",), target="x"),
+        ]
+        data = layering(self.layering_query([
+            tx("t1", "s1", "C", usd=10000),
+            tx("t2", "s2", "C", usd=10000, ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", usd=10000, ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", usd=10000, ts="2026-10-04T10:00:30Z"),
+        ], routes=routes))
+        alerts = data["alerts"]
+        # 事件 score 80：r1（min 80）与 r2（min 40）均命中，r-btc 链不匹配。
+        self.assertEqual(
+            [(a["route_id"], a["event_id"]) for a in alerts],
+            [("r1", "t1"), ("r2", "t1")],
+        )
+        first = alerts[0]
+        self.assertEqual(
+            set(first),
+            {"route_id", "event_id", "chain", "asset", "severity",
+             "score", "reason", "target"},
+        )
+        self.assertEqual(first["chain"], "eth")
+        self.assertEqual(first["asset"], "ETH")
+        self.assertEqual(first["severity"], "critical")
+        self.assertEqual(first["target"], "pager")
+        self.assertEqual(first["score"], 80)
+        self.assertEqual(first["reason"], ["VALUE"])
+
+    def test_alert_min_score_boundary_inclusive(self):
+        data = layering(self.layering_query(
+            [tx("t1", "s1", "C", usd=10000),
+             tx("t2", "s2", "C", usd=10000, ts="2026-10-04T10:00:10Z"),
+             tx("o1", "C", "r1", usd=10000, ts="2026-10-04T10:00:20Z"),
+             tx("o2", "C", "r2", usd=10000, ts="2026-10-04T10:00:30Z")],
+            routes=[route("r", 80, "info")],
+        ))
+        self.assertEqual(
+            [(a["route_id"], a["event_id"]) for a in data["alerts"]],
+            [("r", "t1")],
+        )
+
+    def test_alert_chain_asset_star_and_mismatch(self):
+        data = layering(self.layering_query(
+            [tx("t1", "s1", "C", usd=10000),
+             tx("t2", "s2", "C", usd=10000, ts="2026-10-04T10:00:10Z"),
+             tx("o1", "C", "r1", usd=10000, ts="2026-10-04T10:00:20Z"),
+             tx("o2", "C", "r2", usd=10000, ts="2026-10-04T10:00:30Z")],
+            routes=[route("r", 0, "info", assets=("BTC",))],
+        ))
+        self.assertEqual(data["alerts"], [])
+
+    def assert_layering_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            layering(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_layering_query_errors(self):
+        base = [tx("t1", "s1", "C")]
+        # 缺失 layering_query 整体或任一字段。
+        self.assert_layering_code("INVALID_LAYERING_QUERY", payload(base))
+        for field in ("window_seconds", "min_sources", "min_recipients",
+                      "min_usd_value"):
+            bad = self.layering_query(base)
+            del bad["layering_query"][field]
+            self.assert_layering_code("INVALID_LAYERING_QUERY", bad)
+        # 未知字段与非对象。
+        bad = self.layering_query(base)
+        bad["layering_query"]["unknown"] = 1
+        self.assert_layering_code("INVALID_LAYERING_QUERY", bad)
+        for raw in ([], "x", 1, None, True):
+            bad = self.layering_query(base)
+            bad["layering_query"] = raw
+            self.assert_layering_code("INVALID_LAYERING_QUERY", bad)
+        # window_seconds：1..10000 整数。
+        for bad_value in (0, -1, 10001, 1.0, "5", True, None):
+            self.assert_layering_code(
+                "INVALID_LAYERING_QUERY",
+                self.layering_query(base, window_seconds=bad_value),
+            )
+        # min_sources / min_recipients：2..10000 整数。
+        for field in ("min_sources", "min_recipients"):
+            for bad_value in (1, 0, -1, 10001, 2.0, "2", True, None):
+                self.assert_layering_code(
+                    "INVALID_LAYERING_QUERY",
+                    self.layering_query(base, **{field: bad_value}),
+                )
+        # min_usd_value：非负有限数。
+        for bad_value in (-0.01, "0", True, None,
+                          float("inf"), float("nan")):
+            self.assert_layering_code(
+                "INVALID_LAYERING_QUERY",
+                self.layering_query(base, min_usd_value=bad_value),
+            )
+        # 边界合法。
+        layering(self.layering_query(base, window_seconds=1, min_sources=2,
+                                     min_recipients=2, min_usd_value=0))
+        layering(self.layering_query(base, window_seconds=10000,
+                                     min_sources=10000, min_recipients=10000,
+                                     min_usd_value=0.0))
+
+    def test_error_precedence(self):
+        # threshold -> route -> layering query -> scoring。
+        bad = self.layering_query([], threshold=0,
+                                  routes=[route("r", 200, "info")],
+                                  min_sources=1)
+        self.assert_layering_code("INVALID_THRESHOLD", bad)
+        bad = self.layering_query([], routes=[route("r", 200, "info")],
+                                  min_sources=1)
+        self.assert_layering_code("INVALID_ROUTE", bad)
+        bad = self.layering_query([], min_sources=1)
+        bad["scoring"] = []
+        self.assert_layering_code("INVALID_LAYERING_QUERY", bad)
+        bad = self.layering_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_layering_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.layering_query(
+            [tx("dup", "s1", "C"), tx("dup", "s2", "C", ts="bad")])
+        self.assert_layering_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.layering_query([tx("t1", "s1", "C", amount=0)])
+        self.assert_layering_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class LayeringScoringTests(unittest.TestCase):
+    def layering_with_scoring(self, scoring, **kwargs):
+        transfers = kwargs.pop("transfers", [
+            tx("t1", "s1", "C", usd=10000),
+            tx("t2", "s2", "C", usd=10000, ts="2026-10-04T10:00:10Z"),
+            tx("o1", "C", "r1", usd=10000, ts="2026-10-04T10:00:20Z"),
+            tx("o2", "C", "r2", usd=10000, ts="2026-10-04T10:00:30Z"),
+        ])
+        body = {
+            "transfers": transfers,
+            "whale_threshold_usd": 10000,
+            "routes": kwargs.pop("routes", []),
+            "layering_query": {
+                "window_seconds": kwargs.pop("window_seconds", 3600),
+                "min_sources": 2,
+                "min_recipients": 2,
+                "min_usd_value": 0,
+            },
+        }
+        body.update(kwargs)
+        body["scoring"] = scoring
+        return layering(body)
+
+    def test_scoring_changes_segment_sum(self):
+        data = self.layering_with_scoring(
+            {"value_points_per_ratio": 10, "value_points_cap": 100}
+        )
+        event = data["layering"][0]
+        # 每段 10，合计 40。
+        self.assertEqual(event["score"], 40)
+        self.assertEqual(event["reason"], ["VALUE"])
+
+    def test_sum_caps_at_100(self):
+        data = self.layering_with_scoring(
+            {"value_points_per_ratio": 1000, "value_points_cap": 100}
+        )
+        self.assertEqual(data["layering"][0]["score"], 100)
+
+    def test_invalid_scoring_after_layering_query(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.layering_with_scoring([])
+        self.assertEqual(ctx.exception.code, "INVALID_SCORING_CONFIG")
+
+    def test_layering_query_error_precedes_scoring(self):
+        with self.assertRaises(AnalyzeError) as ctx:
+            self.layering_with_scoring([], window_seconds=0)
+        self.assertEqual(ctx.exception.code, "INVALID_LAYERING_QUERY")
+
+
+class LayeringCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "layering"], input=raw, capture_output=True, text=True
+        )
+
+    def test_success_stdout(self):
+        body = {
+            "transfers": [
+                tx("t1", "s1", "C", usd=1),
+                tx("t2", "s2", "C", usd=1, ts="2026-10-04T10:00:10Z"),
+                tx("o1", "C", "r1", usd=1, ts="2026-10-04T10:00:20Z"),
+                tx("o2", "C", "r2", usd=1, ts="2026-10-04T10:00:30Z"),
+            ],
+            "whale_threshold_usd": 10000,
+            "routes": [],
+            "layering_query": {"window_seconds": 3600, "min_sources": 2,
+                               "min_recipients": 2, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"layering", "alerts"})
+        self.assertEqual(out["data"]["layering"][0]["event_id"], "t1")
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_events_and_alerts(self):
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "layering_query": {"window_seconds": 3600, "min_sources": 2,
+                               "min_recipients": 2, "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"data": {"layering": [], "alerts": []}},
+        )
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr), {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_INPUT_SCHEMA"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "layering_query": {"window_seconds": 3600, "min_sources": 2,
+                               "min_usd_value": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_LAYERING_QUERY"}
+        )
+        body = {
+            "transfers": [], "whale_threshold_usd": 10000, "routes": [],
+            "layering_query": {"window_seconds": 3600, "min_sources": 2,
+                               "min_recipients": 2, "min_usd_value": 0},
+            "scoring": {"window_seconds": 0},
+        }
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            json.loads(proc.stderr), {"error": "INVALID_SCORING_CONFIG"}
         )
 
 
