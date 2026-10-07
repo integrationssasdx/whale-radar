@@ -12,6 +12,7 @@ from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.cluster import cluster
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
+from whale_radar.dispatch import dispatch
 from whale_radar.entity import entity
 from whale_radar.handoff import handoff
 from whale_radar.layering import layering
@@ -4248,6 +4249,448 @@ class HandoffCliTests(unittest.TestCase):
             [os.path.join(root, "whale-radar"), "handoff"],
             [sys.executable, "-m", "whale_radar", "handoff"],
             [BIN, "handoff"],
+        ):
+            proc = subprocess.run(
+                invocation, input=body, capture_output=True, text=True,
+                cwd=root,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            results.append(proc.stdout)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+
+
+class DispatchTests(unittest.TestCase):
+    def dispatch_query(self, transfers, routes=None, threshold=10000.0,
+                       dedupe_window_seconds=3600, escalate_score=100):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["dispatch_policy"] = {
+            "dedupe_window_seconds": dedupe_window_seconds,
+            "escalate_score": escalate_score,
+        }
+        return result
+
+    def assert_dispatch_code(self, code, body):
+        with self.assertRaises(AnalyzeError) as context:
+            dispatch(body)
+        self.assertEqual(context.exception.code, code)
+
+    def test_single_alert_fields(self):
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=20000)],
+            routes=[route("r1", 20, "warning")],
+        ))
+        self.assertEqual(set(data), {"dispatches"})
+        self.assertEqual(len(data["dispatches"]), 1)
+        item = data["dispatches"][0]
+        self.assertEqual(
+            set(item),
+            {"target", "subject_addresses", "chain", "asset", "transfer_ids",
+             "route_ids", "first_timestamp", "last_timestamp", "merged_count",
+             "severity", "score", "reason"},
+        )
+        self.assertEqual(item["target"], "ops")
+        self.assertEqual(item["subject_addresses"], ["A", "B"])
+        self.assertEqual(item["chain"], "eth")
+        self.assertEqual(item["asset"], "ETH")
+        self.assertEqual(item["transfer_ids"], ["t1"])
+        self.assertEqual(item["route_ids"], ["r1"])
+        self.assertEqual(item["first_timestamp"], BASE_TS)
+        self.assertEqual(item["last_timestamp"], BASE_TS)
+        self.assertEqual(item["merged_count"], 1)
+        self.assertEqual(item["severity"], "warning")
+        self.assertEqual(item["score"], 40)
+        self.assertEqual(item["reason"], ["VALUE"])
+
+    def test_self_transfer_subject_single_address(self):
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "A", usd=20000)],
+            routes=[route("r1", 0, "info")],
+        ))
+        self.assertEqual(data["dispatches"][0]["subject_addresses"], ["A"])
+
+    def test_unordered_endpoints_grouped(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("t2", "B", "A", usd=20000,
+                   ts="2026-10-04T10:10:00Z"),
+                tx("t1", "A", "B", usd=20000, ts=BASE_TS),
+            ],
+            routes=[route("r1", 0, "info")],
+            dedupe_window_seconds=3600,
+        ))
+        self.assertEqual(len(data["dispatches"]), 1)
+        item = data["dispatches"][0]
+        self.assertEqual(item["subject_addresses"], ["A", "B"])
+        self.assertEqual(item["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(item["first_timestamp"], BASE_TS)
+        self.assertEqual(item["last_timestamp"], "2026-10-04T10:10:00Z")
+        self.assertEqual(item["merged_count"], 2)
+
+    def test_different_endpoints_split_groups(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("t1", "A", "B", usd=20000, ts=BASE_TS),
+                tx("t2", "A", "C", usd=20000, ts=BASE_TS),
+            ],
+            routes=[route("r1", 0, "info")],
+        ))
+        groups = sorted(
+            tuple(item["subject_addresses"]) for item in data["dispatches"]
+        )
+        self.assertEqual(groups, [("A", "B"), ("A", "C")])
+
+    def test_target_chain_asset_partition_groups(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("t1", "A", "B", usd=20000, ts=BASE_TS),
+                tx("t2", "A", "B", usd=20000, ts=BASE_TS, chain="bsc"),
+                tx("t3", "A", "B", usd=20000, ts=BASE_TS, asset="USDC"),
+            ],
+            routes=[
+                {"id": "r1", "min_score": 0, "severity": "info",
+                 "chains": ["*"], "assets": ["*"], "target": "one"},
+                {"id": "r2", "min_score": 0, "severity": "info",
+                 "chains": ["*"], "assets": ["*"], "target": "two"},
+            ],
+        ))
+        # 3 转账 x 2 target = 6 个不同分组（bsc/usdc 因星号也命中）。
+        keys = sorted(
+            (item["target"], item["chain"], item["asset"])
+            for item in data["dispatches"]
+        )
+        self.assertEqual(keys, [
+            ("one", "bsc", "ETH"),
+            ("one", "eth", "ETH"),
+            ("one", "eth", "USDC"),
+            ("two", "bsc", "ETH"),
+            ("two", "eth", "ETH"),
+            ("two", "eth", "USDC"),
+        ])
+
+    def test_closed_window_boundary_and_restart(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("edge", "A", "B", usd=20000,
+                   ts="2026-10-04T10:10:00Z"),
+                tx("start", "A", "B", usd=20000, ts=BASE_TS),
+                tx("outside", "A", "B", usd=20000,
+                   ts="2026-10-04T10:10:01Z"),
+            ],
+            routes=[route("r1", 0, "info")],
+            dedupe_window_seconds=600,
+        ))
+        batches = [
+            (item["transfer_ids"], item["first_timestamp"],
+             item["last_timestamp"], item["merged_count"])
+            for item in data["dispatches"]
+        ]
+        # transfer_ids 去重后按 id 升序；时间首尾按组内解析顺序。
+        self.assertEqual(batches, [
+            (["edge", "start"], BASE_TS, "2026-10-04T10:10:00Z", 2),
+            (["outside"], "2026-10-04T10:10:01Z",
+             "2026-10-04T10:10:01Z", 1),
+        ])
+
+    def test_tie_timestamp_orders_by_transfer_id(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("b", "A", "B", usd=20000, ts=BASE_TS),
+                tx("a", "A", "B", usd=20000, ts=BASE_TS),
+            ],
+            routes=[route("r1", 0, "info")],
+            dedupe_window_seconds=600,
+        ))
+        item = data["dispatches"][0]
+        self.assertEqual(item["transfer_ids"], ["a", "b"])
+        self.assertEqual(item["first_timestamp"], BASE_TS)
+
+    def test_route_ids_dedup_sorted_and_merged_count(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("t1", "A", "B", usd=20000, ts=BASE_TS),
+                tx("t2", "A", "B", usd=20000,
+                   ts="2026-10-04T10:05:00Z"),
+            ],
+            routes=[
+                route("rz", 0, "info"),
+                route("ra", 0, "critical"),
+            ],
+            dedupe_window_seconds=600,
+        ))
+        item = data["dispatches"][0]
+        # 2 转账 x 2 route = 4 条 analyze 告警合并为一批。
+        self.assertEqual(item["route_ids"], ["ra", "rz"])
+        self.assertEqual(item["merged_count"], 4)
+
+    def test_score_takes_max_and_reasons_merged_in_order(self):
+        # t1 窗口含 5 笔、5 个接收方 -> VALUE+BURST+FAN_OUT=65；t2 在同一
+        # 两端分组的同去重窗口内但自身窗口只有 1 笔 -> 仅 VALUE=40。合并后
+        # score 取最高 65，reason 取并集 VALUE/BURST/FAN_OUT。
+        transfers = [
+            tx("t1", "A", "B", usd=10000, ts=BASE_TS),
+            tx("t3", "A", "C", usd=1, ts="2026-10-04T10:01:00Z"),
+            tx("t4", "A", "D", usd=1, ts="2026-10-04T10:02:00Z"),
+            tx("t5", "A", "E", usd=1, ts="2026-10-04T10:03:00Z"),
+            tx("t6", "A", "F", usd=1, ts="2026-10-04T10:04:00Z"),
+            tx("t2", "A", "B", usd=20000, ts="2026-10-04T10:05:00Z"),
+        ]
+        data = dispatch(self.dispatch_query(
+            transfers, routes=[route("r1", 0, "info")],
+            dedupe_window_seconds=3600,
+        ))
+        by_subjects = {
+            tuple(item["subject_addresses"]): item
+            for item in data["dispatches"]
+        }
+        ab = by_subjects[("A", "B")]
+        self.assertEqual(ab["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(ab["score"], 65)
+        self.assertEqual(ab["reason"], ["VALUE", "BURST", "FAN_OUT"])
+
+    def test_round_trip_reason_merged(self):
+        data = dispatch(self.dispatch_query(
+            [
+                tx("t1", "A", "B", amount=1.0, usd=20000, ts=BASE_TS),
+                tx("t2", "B", "A", amount=1.0, usd=20000,
+                   ts="2026-10-04T10:05:00Z"),
+            ],
+            routes=[route("r1", 0, "info")],
+            dedupe_window_seconds=600,
+        ))
+        item = data["dispatches"][0]
+        self.assertEqual(item["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_severity_takes_max_then_escalation(self):
+        routes = [
+            route("ri", 0, "info"),
+            route("rc", 0, "critical"),
+        ]
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=10000, ts=BASE_TS)],
+            routes=routes, escalate_score=100,
+        ))
+        self.assertEqual(data["dispatches"][0]["severity"], "critical")
+
+        # 批内最高仅 info，但 score 达到 escalate_score 时改判 critical。
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=10000, ts=BASE_TS)],
+            routes=[route("ri", 0, "info")], escalate_score=20,
+        ))
+        self.assertEqual(data["dispatches"][0]["severity"], "critical")
+
+        # 等值命中。
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=10000, ts=BASE_TS)],
+            routes=[route("ri", 0, "warning")], escalate_score=20.0,
+        ))
+        self.assertEqual(data["dispatches"][0]["severity"], "critical")
+
+        # 未达阈值保留 route severity。
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=10000, ts=BASE_TS)],
+            routes=[route("ri", 0, "info")], escalate_score=20.01,
+        ))
+        self.assertEqual(data["dispatches"][0]["severity"], "info")
+
+    def test_dispatches_sorted(self):
+        routes = [
+            {"id": "r", "min_score": 0, "severity": "info",
+             "chains": ["eth"], "assets": ["*"], "target": "zzz"},
+            {"id": "r", "min_score": 0, "severity": "critical",
+             "chains": ["eth"], "assets": ["*"], "target": "aaa"},
+        ]
+        data = dispatch(self.dispatch_query(
+            [
+                tx("low", "A", "B", usd=10000, ts=BASE_TS),
+                tx("high", "C", "D", usd=50000, ts=BASE_TS),
+            ],
+            routes=routes, escalate_score=100,
+        ))
+        order = [
+            (item["severity"], item["score"], item["target"],
+             item["transfer_ids"])
+            for item in data["dispatches"]
+        ]
+        self.assertEqual(order, [
+            ("critical", 40, "aaa", ["high"]),
+            ("critical", 20, "aaa", ["low"]),
+            ("info", 40, "zzz", ["high"]),
+            ("info", 20, "zzz", ["low"]),
+        ])
+
+    def test_raw_timestamp_preserved_verbatim(self):
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=20000,
+                ts="2026-10-04T12:00:00+02:00")],
+            routes=[route("r1", 0, "info")],
+        ))
+        item = data["dispatches"][0]
+        self.assertEqual(item["first_timestamp"], "2026-10-04T12:00:00+02:00")
+        self.assertEqual(item["last_timestamp"], "2026-10-04T12:00:00+02:00")
+
+    def test_no_candidates_empty(self):
+        # route 链不匹配：无 analyze 告警。
+        data = dispatch(self.dispatch_query(
+            [tx("t1", "A", "B", usd=20000)],
+            routes=[
+                {"id": "r1", "min_score": 0, "severity": "info",
+                 "chains": ["bsc"], "assets": ["*"], "target": "ops"},
+            ],
+        ))
+        self.assertEqual(data, {"dispatches": []})
+        # 无转账亦为空数组。
+        data = dispatch(self.dispatch_query([]))
+        self.assertEqual(data, {"dispatches": []})
+
+    def test_policy_validation(self):
+        base = self.dispatch_query([])
+        for raw in (
+            None, 5, "x", [],
+            {"escalate_score": 50},
+            {"dedupe_window_seconds": 60},
+            {"dedupe_window_seconds": 60, "escalate_score": 50, "x": 1},
+        ):
+            bad = dict(base)
+            bad["dispatch_policy"] = raw
+            self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        # dedupe_window_seconds：1..86400 整数。
+        for bad_value in (0, -1, 86401, 60.0, "60", True, None):
+            bad = self.dispatch_query(
+                [], dedupe_window_seconds=bad_value, escalate_score=50
+            )
+            self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        # escalate_score：0..100 有限数。
+        for bad_value in (-0.1, 100.1, "50", True, False, None,
+                          float("inf"), float("nan")):
+            bad = self.dispatch_query(
+                [], dedupe_window_seconds=60, escalate_score=bad_value
+            )
+            self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        # 边界合法。
+        dispatch(self.dispatch_query(
+            [], dedupe_window_seconds=1, escalate_score=0))
+        dispatch(self.dispatch_query(
+            [], dedupe_window_seconds=86400, escalate_score=100))
+
+    def test_error_precedence(self):
+        # route -> dispatch_policy -> scoring。
+        bad = self.dispatch_query(
+            [], routes=[route("r", 0, "nope")],
+            dedupe_window_seconds=0,
+        )
+        self.assert_dispatch_code("INVALID_ROUTE", bad)
+        bad = self.dispatch_query([], dedupe_window_seconds=0)
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        bad = self.dispatch_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_dispatch_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_scoring_changes_candidate_scores(self):
+        body = self.dispatch_query(
+            [tx("t1", "A", "B", usd=10000)],
+            routes=[route("r1", 0, "info")],
+        )
+        body["scoring"] = {"value_points_per_ratio": 5}
+        item = dispatch(body)["dispatches"][0]
+        self.assertEqual(item["score"], 5)
+
+
+class DispatchCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "dispatch"], input=raw, capture_output=True, text=True
+        )
+
+    def body(self, **policy):
+        result = payload(
+            [
+                tx("t1", "A", "B", usd=20000, ts=BASE_TS),
+                tx("t2", "A", "B", usd=20000,
+                   ts="2026-10-04T10:05:00Z"),
+            ],
+            routes=[route("r1", 0, "warning")],
+        )
+        result["dispatch_policy"] = {
+            "dedupe_window_seconds": 600,
+            "escalate_score": 100,
+            **policy,
+        }
+        return result
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(self.body()))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"dispatches"})
+        item = out["data"]["dispatches"][0]
+        self.assertEqual(item["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(item["merged_count"], 2)
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_dispatches(self):
+        body = self.body()
+        body["transfers"] = []
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout),
+                         {"data": {"dispatches": []}})
+
+    def test_not_json(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INPUT_NOT_JSON"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_INPUT_SCHEMA"})
+        proc = self.run_cli(json.dumps(self.body(dedupe_window_seconds=0)))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_DISPATCH_POLICY"})
+
+    def test_dispatch_policy_before_scoring_via_cli(self):
+        body = self.body()
+        body["dispatch_policy"] = {}
+        body["scoring"] = {"window_seconds": 0}
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_DISPATCH_POLICY"})
+
+    def test_non_ascii_round_trip(self):
+        body = self.body()
+        body["transfers"] = [
+            tx("转甲", "地址甲", "地址乙", usd=20000, chain="链一"),
+        ]
+        body["routes"] = [
+            {"id": "r1", "min_score": 0, "severity": "info",
+             "chains": ["*"], "assets": ["*"], "target": "运营"},
+        ]
+        proc = self.run_cli(json.dumps(body, ensure_ascii=False))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = json.loads(proc.stdout)["data"]["dispatches"][0]
+        self.assertEqual(item["target"], "运营")
+        self.assertEqual(item["subject_addresses"], ["地址乙", "地址甲"])
+        self.assertEqual(item["transfer_ids"], ["转甲"])
+
+    def test_three_entry_points_equivalent(self):
+        body = json.dumps(self.body())
+        results = []
+        root = os.path.dirname(os.path.dirname(BIN))
+        for invocation in (
+            [os.path.join(root, "whale-radar"), "dispatch"],
+            [sys.executable, "-m", "whale_radar", "dispatch"],
+            [BIN, "dispatch"],
         ):
             proc = subprocess.run(
                 invocation, input=body, capture_output=True, text=True,

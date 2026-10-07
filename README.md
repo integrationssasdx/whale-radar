@@ -9,8 +9,8 @@
 ## 状态
 
 基线已含 analyze、trace、trace-risk、rank、entity、watch、converge、cycles、
-layering、cluster、handoff 十一个子命令的分析实现，以及仓库根目录的产品入口与
-`python -m whale_radar` 模块入口。
+layering、cluster、handoff、dispatch 十二个子命令的分析实现，以及仓库根目录的
+产品入口与 `python -m whale_radar` 模块入口。
 
 ## 约定
 
@@ -36,7 +36,7 @@ stdout 为空，退出码 2。
 
 ## 命令
 
-十个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
+十二个子命令均从 stdin 读取一个 JSON 值、成功时向 stdout 写一个含 `data`
 的 JSON 对象和换行（退出码 0）；输入错误不落任何部分报告，以退出码 2
 结束并向 stderr 输出 `{"error": 错误码}` 和换行。仅依赖 Python 3 标准库：
 
@@ -209,11 +209,31 @@ stdout 为空，退出码 2。
   排序。handoff 的错误码顺序为 INPUT_NOT_JSON > INVALID_INPUT_SCHEMA
   > DUPLICATE_TRANSFER_ID > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD
   > INVALID_ROUTE > INVALID_HANDOFF_QUERY > INVALID_SCORING_CONFIG。
+- `whale-radar dispatch`：把 analyze 告警按去重窗口合并成通知批次
+  （dispatches）。输入沿用 analyze 的 transfers、whale_threshold_usd、
+  routes 与可选 scoring，外加恰含 `dedupe_window_seconds`（1..86400
+  整数）与 `escalate_score`（0..100 有限数）的 `dispatch_policy` 对象，
+  缺项、未知字段、布尔或类型范围错误均报 INVALID_DISPATCH_POLICY。候选
+  沿用 analyze 的 route 匹配、score、reason 与告警，按 target、chain、
+  asset 和转账两端地址（无序）分组；组内按解析时间、transfer_id 升序，
+  首条为起点，闭区间到起点加 dedupe_window_seconds，窗外另起一批。每项
+  含 target、subject_addresses（两端地址去重升序）、chain、asset、
+  transfer_ids、route_ids（去重升序）、first_timestamp、last_timestamp
+  （首尾原 timestamp）、merged_count（合并的告警数）、severity、score、
+  reason；score 取批内最高，reason 按 VALUE、BURST、FAN_OUT、ROUND_TRIP
+  去重合并。severity 按 info、warning、critical 取批内最高，score 达到
+  escalate_score（等值命中）时改判 critical。dispatches 按 severity、
+  score 降序，再按 target、transfer_ids 升序；无候选时为空数组，成功时
+  data 仅含 `dispatches`。dispatch 的错误码顺序为 INPUT_NOT_JSON
+  > INVALID_INPUT_SCHEMA > DUPLICATE_TRANSFER_ID
+  > INVALID_TRANSFER_VALUE > INVALID_THRESHOLD > INVALID_ROUTE
+  > INVALID_DISPATCH_POLICY > INVALID_SCORING_CONFIG；dispatch_policy 与
+  scoring 同时非法时先报 INVALID_DISPATCH_POLICY。
 
 ## scoring 配置
 
 `analyze`、`trace-risk`、`rank`、`entity`、`watch`、`cycles`、`layering`、
-`handoff` 接受可选的
+`handoff`、`dispatch` 接受可选的
 顶层 `scoring` 对象，逐项覆盖异常打分的窗口、阈值与分值；省略 `scoring`
 或仅提供部分字段时，缺失项沿用下列基线值，输出与基线完全一致。
 `converge` 校验 `scoring`（非法时报 INVALID_SCORING_CONFIG）但不将其
@@ -248,12 +268,13 @@ trace-risk 的路径分值仍为各段之和后限制在 100，只返回 `paths`
 
 `scoring` 不是对象、含未知字段，或任一字段类型/范围不合法时，
 analyze、trace-risk、rank、entity、watch、converge、cycles、layering、
-handoff 九个命令均向
+handoff、dispatch 十个命令均向
 stderr 输出 `{"error": "INVALID_SCORING_CONFIG"}` 和换行，stdout 为空，
 退出码 2，且不落任何部分报告。该错误在既有校验全部通过之后才触发：
 analyze 与 rank 中晚于 INVALID_ROUTE，trace-risk 中晚于
 INVALID_TRACE_QUERY，entity 中晚于 INVALID_ENTITY_QUERY，watch 中晚于
 INVALID_WATCH_QUERY，converge 中晚于 INVALID_CONVERGENCE_QUERY，cycles
 中晚于 INVALID_CYCLE_QUERY，layering 中晚于 INVALID_LAYERING_QUERY，
-handoff 中晚于 INVALID_HANDOFF_QUERY；
+handoff 中晚于 INVALID_HANDOFF_QUERY，dispatch 中晚于
+INVALID_DISPATCH_POLICY；
 `trace` 永不产生此错误。
