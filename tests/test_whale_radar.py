@@ -12,6 +12,7 @@ from whale_radar.analyzer import AnalyzeError, analyze
 from whale_radar.cluster import cluster
 from whale_radar.converge import converge
 from whale_radar.cycles import cycles
+from whale_radar.dispatch import dispatch
 from whale_radar.entity import entity
 from whale_radar.handoff import handoff
 from whale_radar.layering import layering
@@ -4248,6 +4249,352 @@ class HandoffCliTests(unittest.TestCase):
             [os.path.join(root, "whale-radar"), "handoff"],
             [sys.executable, "-m", "whale_radar", "handoff"],
             [BIN, "handoff"],
+        ):
+            proc = subprocess.run(
+                invocation, input=body, capture_output=True, text=True,
+                cwd=root,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            results.append(proc.stdout)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+
+
+class DispatchTests(unittest.TestCase):
+    def dispatch_query(self, transfers, routes=None, threshold=10000.0,
+                       dedupe_window_seconds=3600, escalate_score=100,
+                       scoring=None):
+        result = payload(transfers, threshold=threshold, routes=routes)
+        result["dispatch_policy"] = {
+            "dedupe_window_seconds": dedupe_window_seconds,
+            "escalate_score": escalate_score,
+        }
+        if scoring is not None:
+            result["scoring"] = scoring
+        return result
+
+    def test_alerts_grouped_and_merged_unordered_endpoints(self):
+        data = dispatch(self.dispatch_query([
+            tx("t2", "B", "A", usd=50000, ts="2026-10-04T10:05:00Z"),
+            tx("t1", "A", "B", usd=50000),
+        ], routes=[route("r1", 40, "warning")], escalate_score=80))
+        self.assertEqual(set(data), {"dispatches"})
+        dispatches = data["dispatches"]
+        self.assertEqual(len(dispatches), 1)
+        item = dispatches[0]
+        self.assertEqual(
+            set(item),
+            {"target", "subject_addresses", "chain", "asset", "transfer_ids",
+             "route_ids", "first_timestamp", "last_timestamp", "merged_count",
+             "severity", "score", "reason"},
+        )
+        # 组内按解析时间、transfer_id 升序；正反向两端地址同组。
+        self.assertEqual(item["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(item["subject_addresses"], ["A", "B"])
+        self.assertEqual(item["route_ids"], ["r1"])
+        self.assertEqual(item["first_timestamp"], BASE_TS)
+        self.assertEqual(item["last_timestamp"], "2026-10-04T10:05:00Z")
+        self.assertEqual(item["merged_count"], 2)
+        self.assertEqual(item["chain"], "eth")
+        self.assertEqual(item["asset"], "ETH")
+        self.assertEqual(item["target"], "ops")
+        # score 取最高（往返命中 40+15=55），severity 未达升级线。
+        self.assertEqual(item["score"], 55)
+        self.assertEqual(item["severity"], "warning")
+        self.assertEqual(item["reason"], ["VALUE", "ROUND_TRIP"])
+
+    def test_window_closed_boundary_starts_new_batch(self):
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "B", usd=0),
+            tx("t2", "A", "B", usd=0, ts="2026-10-04T10:10:00Z"),
+            tx("t3", "A", "B", usd=0, ts="2026-10-04T10:10:01Z"),
+        ], routes=[route("r", 0, "info")], dedupe_window_seconds=600))
+        batches = [
+            (d["transfer_ids"], d["first_timestamp"], d["last_timestamp"],
+             d["merged_count"])
+            for d in data["dispatches"]
+        ]
+        # 恰好 600 秒为闭区间同批；601 秒的 t3 另起一批。
+        self.assertEqual(
+            batches,
+            [(["t1", "t2"], BASE_TS, "2026-10-04T10:10:00Z", 2),
+             (["t3"], "2026-10-04T10:10:01Z",
+              "2026-10-04T10:10:01Z", 1)],
+        )
+
+    def test_groups_split_by_target_chain_asset_endpoints(self):
+        routes = [
+            route("r", 0, "info", target="ops"),
+            route("r2", 0, "info", target="pager"),
+        ]
+        data = dispatch(self.dispatch_query([
+            tx("g1", "A", "B", usd=0),
+            tx("g2", "A", "C", usd=0),
+            tx("g3", "A", "B", usd=0, chain="bsc"),
+            tx("g4", "A", "B", usd=0, asset="USDC"),
+        ], routes=routes))
+        keys = sorted(
+            (d["target"], d["chain"], d["asset"],
+             tuple(d["subject_addresses"]), d["transfer_ids"])
+            for d in data["dispatches"]
+        )
+        self.assertEqual(keys, [
+            ("ops", "bsc", "ETH", ("A", "B"), ["g3"]),
+            ("ops", "eth", "ETH", ("A", "B"), ["g1"]),
+            ("ops", "eth", "ETH", ("A", "C"), ["g2"]),
+            ("ops", "eth", "USDC", ("A", "B"), ["g4"]),
+            ("pager", "bsc", "ETH", ("A", "B"), ["g3"]),
+            ("pager", "eth", "ETH", ("A", "B"), ["g1"]),
+            ("pager", "eth", "ETH", ("A", "C"), ["g2"]),
+            ("pager", "eth", "USDC", ("A", "B"), ["g4"]),
+        ])
+
+    def test_multi_route_alerts_count_transfer_ids_deduped(self):
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "B", usd=50000),
+        ], routes=[
+            route("ra", 40, "info"),
+            route("rb", 40, "critical"),
+            route("rc", 0, "warning"),
+        ], escalate_score=100))
+        self.assertEqual(len(data["dispatches"]), 1)
+        item = data["dispatches"][0]
+        # 三条告警合并：merged_count 计告警数，transfer_ids 去重。
+        self.assertEqual(item["merged_count"], 3)
+        self.assertEqual(item["transfer_ids"], ["t1"])
+        self.assertEqual(item["route_ids"], ["ra", "rb", "rc"])
+        # severity 取 info/warning/critical 最高。
+        self.assertEqual(item["severity"], "critical")
+
+    def test_severity_escalates_at_threshold(self):
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "B", usd=10000),
+        ], routes=[route("r", 20, "info")], escalate_score=20))
+        self.assertEqual(data["dispatches"][0]["severity"], "critical")
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "B", usd=10000),
+        ], routes=[route("r", 20, "info")], escalate_score=20.0001))
+        self.assertEqual(data["dispatches"][0]["severity"], "info")
+
+    def test_self_transfer_single_subject(self):
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "A", usd=0),
+        ], routes=[route("r", 0, "info")]))
+        self.assertEqual(data["dispatches"][0]["subject_addresses"], ["A"])
+
+    def test_reason_merge_order(self):
+        data = dispatch(self.dispatch_query([
+            tx("t1", "A", "B", usd=50000),
+            tx("t2", "B", "A", usd=50000, ts="2026-10-04T10:00:10Z"),
+        ], routes=[route("r", 0, "info")], escalate_score=100))
+        self.assertEqual(
+            data["dispatches"][0]["reason"], ["VALUE", "ROUND_TRIP"]
+        )
+
+    def test_scoring_changes_candidate_scores(self):
+        data = dispatch(self.dispatch_query([
+            tx("t%d" % i, "A", "B", usd=0,
+               ts="2026-10-04T10:00:%02dZ" % i)
+            for i in range(5)
+        ], routes=[route("r", 25, "info")], escalate_score=100,
+            scoring={"transfer_burst_points": 25}))
+        self.assertEqual(len(data["dispatches"]), 1)
+        self.assertEqual(data["dispatches"][0]["score"], 25)
+        self.assertEqual(data["dispatches"][0]["reason"], ["BURST"])
+
+    def test_dispatches_sorted_severity_score_target_ids(self):
+        data = dispatch(self.dispatch_query([
+            tx("a", "A", "A", usd=50000),                 # 40 升 critical
+            tx("b", "B", "C", usd=10000),                 # 20 warning
+            tx("c", "D", "E", usd=50000),                 # 40 升 critical
+        ], routes=[
+            route("r1", 0, "warning", target="zeta"),
+            route("r2", 0, "warning", target="alpha"),
+        ], escalate_score=40))
+        self.assertEqual(
+            [(d["severity"], d["score"], d["target"], d["transfer_ids"])
+             for d in data["dispatches"]],
+            [
+                ("critical", 40, "alpha", ["a"]),
+                ("critical", 40, "alpha", ["c"]),
+                ("critical", 40, "zeta", ["a"]),
+                ("critical", 40, "zeta", ["c"]),
+                ("warning", 20, "alpha", ["b"]),
+                ("warning", 20, "zeta", ["b"]),
+            ],
+        )
+
+    def test_no_candidates_empty(self):
+        self.assertEqual(dispatch(self.dispatch_query([])),
+                         {"dispatches": []})
+        # 有转账但无 route 命中时同样为空。
+        self.assertEqual(
+            dispatch(self.dispatch_query([tx("t1", "A", "B", usd=0)])),
+            {"dispatches": []},
+        )
+
+    def assert_dispatch_code(self, code, obj):
+        with self.assertRaises(AnalyzeError) as ctx:
+            dispatch(obj)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_dispatch_policy_errors(self):
+        base = [tx("t1", "A", "B")]
+        # 缺失 dispatch_policy 整体或任一字段。
+        self.assert_dispatch_code("INVALID_DISPATCH_POLICY", payload(base))
+        for field in ("dedupe_window_seconds", "escalate_score"):
+            bad = self.dispatch_query(base)
+            del bad["dispatch_policy"][field]
+            self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        # 未知字段与非对象。
+        bad = self.dispatch_query(base)
+        bad["dispatch_policy"]["unknown"] = 1
+        self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        for raw in ([], "x", 1, None, True):
+            bad = self.dispatch_query(base)
+            bad["dispatch_policy"] = raw
+            self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        # dedupe_window_seconds：1..86400 整数。
+        for bad_value in (0, -1, 86401, 1.0, "600", True, None):
+            self.assert_dispatch_code(
+                "INVALID_DISPATCH_POLICY",
+                self.dispatch_query(base, dedupe_window_seconds=bad_value),
+            )
+        # escalate_score：0..100 有限数。
+        for bad_value in (-0.1, 100.1, "50", True, None,
+                          float("inf"), float("nan")):
+            self.assert_dispatch_code(
+                "INVALID_DISPATCH_POLICY",
+                self.dispatch_query(base, escalate_score=bad_value),
+            )
+        # 边界合法。
+        dispatch(self.dispatch_query(
+            base, dedupe_window_seconds=1, escalate_score=0))
+        dispatch(self.dispatch_query(
+            base, dedupe_window_seconds=86400, escalate_score=100))
+
+    def test_error_precedence(self):
+        # route -> dispatch_policy -> scoring。
+        bad = self.dispatch_query(
+            [], routes=[route("r", 200, "info")],
+            dedupe_window_seconds=0)
+        self.assert_dispatch_code("INVALID_ROUTE", bad)
+        bad = self.dispatch_query([], dedupe_window_seconds=0)
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_dispatch_code("INVALID_DISPATCH_POLICY", bad)
+        bad = self.dispatch_query([])
+        bad["scoring"] = {"window_seconds": 0}
+        self.assert_dispatch_code("INVALID_SCORING_CONFIG", bad)
+
+    def test_duplicate_and_value_precedence(self):
+        bad = self.dispatch_query(
+            [tx("dup", "A", "B"), tx("dup", "B", "A", ts="bad")])
+        self.assert_dispatch_code("DUPLICATE_TRANSFER_ID", bad)
+        bad = self.dispatch_query([tx("t1", "A", "B", amount=0)])
+        self.assert_dispatch_code("INVALID_TRANSFER_VALUE", bad)
+
+
+class DispatchCliTests(unittest.TestCase):
+    def run_cli(self, raw):
+        return subprocess.run(
+            [BIN, "dispatch"], input=raw, capture_output=True, text=True
+        )
+
+    def body(self, **policy):
+        result = {
+            "transfers": [
+                tx("t1", "A", "B", usd=50000),
+                tx("t2", "B", "A", usd=50000, ts="2026-10-04T10:05:00Z"),
+            ],
+            "whale_threshold_usd": 10000,
+            "routes": [route("r1", 40, "warning")],
+            "dispatch_policy": {"dedupe_window_seconds": 600,
+                                "escalate_score": 80, **policy},
+        }
+        return result
+
+    def test_success_stdout(self):
+        proc = self.run_cli(json.dumps(self.body()))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(set(out), {"data"})
+        self.assertEqual(set(out["data"]), {"dispatches"})
+        item = out["data"]["dispatches"][0]
+        self.assertEqual(item["transfer_ids"], ["t1", "t2"])
+        self.assertEqual(proc.stderr, "")
+
+    def test_empty_dispatches(self):
+        body = self.body()
+        body["transfers"] = []
+        body["routes"] = []
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout),
+                         {"data": {"dispatches": []}})
+
+    def test_not_json_and_non_object(self):
+        proc = self.run_cli("{not json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INPUT_NOT_JSON"})
+        proc = self.run_cli("[]")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_INPUT_SCHEMA"})
+
+    def test_error_codes_via_cli(self):
+        proc = self.run_cli(json.dumps({"transfers": []}))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_INPUT_SCHEMA"})
+        proc = self.run_cli(json.dumps(self.body(dedupe_window_seconds=0)))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_DISPATCH_POLICY"})
+        body = self.body()
+        body["scoring"] = {"window_seconds": 0}
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_SCORING_CONFIG"})
+        # dispatch_policy 与 scoring 同时非法时先报 policy。
+        body = self.body(dedupe_window_seconds=0)
+        body["scoring"] = {"window_seconds": 0}
+        proc = self.run_cli(json.dumps(body))
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr),
+                         {"error": "INVALID_DISPATCH_POLICY"})
+
+    def test_non_ascii_round_trip(self):
+        body = self.body()
+        body["transfers"] = [
+            tx("转甲", "地址甲", "地址乙", usd=50000),
+            tx("转乙", "地址乙", "地址甲", usd=50000,
+               ts="2026-10-04T10:05:00Z"),
+        ]
+        proc = self.run_cli(json.dumps(body, ensure_ascii=False))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = json.loads(proc.stdout)["data"]["dispatches"][0]
+        # transfer_ids 去重后按字典序（乙 U+4E59 < 甲 U+7532），与批次的
+        # 时间顺序无关；first/last_timestamp 才按解析时间取首尾。
+        self.assertEqual(item["transfer_ids"], ["转乙", "转甲"])
+        self.assertEqual(item["first_timestamp"], BASE_TS)
+        self.assertEqual(item["last_timestamp"], "2026-10-04T10:05:00Z")
+        self.assertEqual(item["subject_addresses"], ["地址乙", "地址甲"])
+
+    def test_three_entry_points_equivalent(self):
+        body = json.dumps(self.body())
+        results = []
+        root = os.path.dirname(os.path.dirname(BIN))
+        for invocation in (
+            [os.path.join(root, "whale-radar"), "dispatch"],
+            [sys.executable, "-m", "whale_radar", "dispatch"],
+            [BIN, "dispatch"],
         ):
             proc = subprocess.run(
                 invocation, input=body, capture_output=True, text=True,
